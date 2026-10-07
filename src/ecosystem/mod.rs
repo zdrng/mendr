@@ -73,7 +73,7 @@ pub struct DeclaredDep {
 /// verification steps. `None` skips the step.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commands {
-    /// e.g. `npm ci --ignore-scripts`; Cargo: `None`.
+    /// e.g. `npm ci --no-audit --no-fund` (npm default); Cargo: `None`.
     pub install: Option<String>,
     /// e.g. `cargo build --locked --all-targets`.
     pub build: Option<String>,
