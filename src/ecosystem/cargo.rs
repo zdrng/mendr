@@ -36,6 +36,7 @@ use toml_edit::{DocumentMut, Item, TableLike, Value};
 
 use super::{
     AdapterError, ApplyOptions, Commands, DeclaredDep, Ecosystem, Release, has_files, run,
+    semver_bump_kind,
 };
 use crate::model::{BumpKind, Change, DepGraph, NodeId, Strategy, Version, VersionReq};
 
@@ -248,23 +249,6 @@ fn compare_versions(a: &str, b: &str) -> Ordering {
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => a.cmp(b),
-    }
-}
-
-/// 0.x-aware: the left-most non-zero component is the "major" one.
-fn bump_kind_of(from: &str, to: &str) -> BumpKind {
-    let (Some(a), Some(b)) = (semver(from), semver(to)) else {
-        return BumpKind::Major;
-    };
-    if a.major != b.major
-        || (a.major == 0 && a.minor != b.minor)
-        || (a.major == 0 && a.minor == 0 && a.patch != b.patch)
-    {
-        BumpKind::Major
-    } else if a.minor != b.minor {
-        BumpKind::Minor
-    } else {
-        BumpKind::Patch
     }
 }
 
@@ -738,7 +722,12 @@ impl Ecosystem for Cargo {
     }
 
     fn bump_kind(&self, from: &Version, to: &Version) -> BumpKind {
-        bump_kind_of(from.as_str(), to.as_str())
+        match (semver(from.as_str()), semver(to.as_str())) {
+            (Some(a), Some(b)) => {
+                semver_bump_kind((a.major, a.minor, a.patch), (b.major, b.minor, b.patch))
+            }
+            _ => BumpKind::Major,
+        }
     }
 
     fn is_prerelease(&self, version: &Version) -> bool {

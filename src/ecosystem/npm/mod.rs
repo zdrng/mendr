@@ -116,19 +116,11 @@ impl Ecosystem for Npm {
     }
 
     fn bump_kind(&self, from: &Version, to: &Version) -> BumpKind {
-        let (Some(a), Some(b)) = (Ver::parse(from.as_str()), Ver::parse(to.as_str())) else {
-            return BumpKind::Major;
-        };
-        // What `^from` allows: 0.x minors and 0.0.x patches are breaking.
-        if a.major != b.major
-            || (a.major == 0 && a.minor != b.minor)
-            || (a.major == 0 && a.minor == 0 && a.patch != b.patch)
-        {
-            BumpKind::Major
-        } else if a.minor != b.minor {
-            BumpKind::Minor
-        } else {
-            BumpKind::Patch
+        match (Ver::parse(from.as_str()), Ver::parse(to.as_str())) {
+            (Some(a), Some(b)) => {
+                super::semver_bump_kind((a.major, a.minor, a.patch), (b.major, b.minor, b.patch))
+            }
+            _ => BumpKind::Major,
         }
     }
 

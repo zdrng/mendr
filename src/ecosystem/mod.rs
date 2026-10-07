@@ -20,7 +20,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Change, DepGraph, FailReason, Strategy, Version, VersionReq};
+use crate::model::{BumpKind, Change, DepGraph, FailReason, Strategy, Version, VersionReq};
 
 // ---- Adapter modules (registration point 1 of 2) ---------------------------
 pub mod cargo;
@@ -140,10 +140,6 @@ impl From<crate::http::HttpError> for AdapterError {
     }
 }
 
-/// One package ecosystem. Implementations are stateless or hold only caches
-/// (use `RefCell`/`Mutex` for memoization behind `&self`).
-///
-/// All methods are blocking. Must stay object-safe (`Box<dyn Ecosystem>`).
 /// Options for [`Ecosystem::apply`].
 #[derive(Debug, Clone, Default)]
 pub struct ApplyOptions {
@@ -152,6 +148,10 @@ pub struct ApplyOptions {
     pub release_cutoff: Option<jiff::Timestamp>,
 }
 
+/// One package ecosystem. Implementations are stateless or hold only caches
+/// (use `RefCell`/`Mutex` for memoization behind `&self`).
+///
+/// All methods are blocking. Must stay object-safe (`Box<dyn Ecosystem>`).
 pub trait Ecosystem {
     /// Short identifier used in config and reports: `"cargo"`, `"npm"`.
     fn name(&self) -> &'static str;
@@ -179,7 +179,7 @@ pub trait Ecosystem {
 
     /// Size of the change `from -> to` (`to` > `from`). 0.x-aware for
     /// semver ecosystems: `0.1.2 -> 0.2.0` is `Major`.
-    fn bump_kind(&self, from: &Version, to: &Version) -> crate::model::BumpKind;
+    fn bump_kind(&self, from: &Version, to: &Version) -> BumpKind;
 
     /// Whether `version` is a prerelease. The planner never picks a
     /// prerelease as a fix target unless the current version is one.
@@ -255,6 +255,20 @@ pub fn describe(cmd: &Command) -> String {
         s.push_str(&arg.to_string_lossy());
     }
     s
+}
+
+/// Bump kind of `from -> to` for `(major, minor, patch)` versions under
+/// caret semantics (Cargo, npm): the left-most non-zero component is the
+/// "major" one, so `0.1.9 -> 0.2.0` and `0.0.1 -> 0.0.2` are `Major`.
+pub fn semver_bump_kind(from: (u64, u64, u64), to: (u64, u64, u64)) -> BumpKind {
+    let ((a0, a1, a2), (b0, b1, b2)) = (from, to);
+    if a0 != b0 || (a0 == 0 && a1 != b1) || (a0 == 0 && a1 == 0 && a2 != b2) {
+        BumpKind::Major
+    } else if a1 != b1 {
+        BumpKind::Minor
+    } else {
+        BumpKind::Patch
+    }
 }
 
 /// Convenience: `dir.join(name).is_file()` for every name.

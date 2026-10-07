@@ -1,12 +1,6 @@
 //! mendr: find known vulnerabilities in project dependencies and fix them the
 //! way a developer would. See PLAN.md for the design.
 
-// The adapter-facing contracts (graph builders, `ecosystem::run`, `apply`,
-// `log_tail`, ...) are only used once the Cargo/npm adapters and
-// verification land (M2-M4).
-// TODO(M4): remove this allow once all adapters are registered.
-#![allow(dead_code)]
-
 mod cache;
 mod config;
 mod ecosystem;

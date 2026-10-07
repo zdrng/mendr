@@ -69,9 +69,7 @@ pub struct VerifyContext<'a> {
 /// Result of verifying one project.
 #[derive(Debug, Default)]
 pub struct Verified {
-    /// Changes that passed verification, in application order.
-    pub kept: Vec<Change>,
-    /// Files (relative to the project) changed by applying `kept`, with their
+    /// Files (relative to the project) changed by the kept changes, with their
     /// content right after `apply`; `None` = deleted.
     pub files: BTreeMap<PathBuf, Option<Vec<u8>>>,
 }
@@ -149,7 +147,7 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
     }
 
     set_outcomes(plan, &kept, &failed, None);
-    Ok(Verified { kept, files })
+    Ok(Verified { files })
 }
 
 /// `--write`: write the files changed by the kept changes (manifests and
@@ -853,7 +851,6 @@ mod tests {
         s.commands.build = Some("echo built > out.txt".into());
         let r = run(&s);
         assert_eq!(r.labels(), labels(&[("p", "fixed"), ("q", "fixed")]));
-        assert_eq!(r.verified.kept.len(), 2);
         let Outcome::Fixed { strategy, change } = &r.plan.findings[0].outcome else {
             panic!("{:?}", r.plan.findings[0].outcome)
         };
@@ -916,7 +913,7 @@ mod tests {
             }
         );
         assert!(s.fake.applied.borrow().is_empty(), "nothing attempted");
-        assert!(r.verified.kept.is_empty() && r.verified.files.is_empty());
+        assert!(r.verified.files.is_empty());
     }
 
     #[test]
@@ -937,7 +934,6 @@ mod tests {
         ));
         // q was applied on the restored state: p is back at 1.0.0.
         assert_eq!(kept_lock(&r), vec!["p@1.0.0", "q@1.0.2"]);
-        assert_eq!(r.verified.kept.len(), 1);
     }
 
     #[test]
@@ -972,7 +968,7 @@ mod tests {
             r.labels(),
             labels(&[("p", "failed:test_failed"), ("q", "failed:test_failed")])
         );
-        assert!(r.verified.kept.is_empty() && r.verified.files.is_empty());
+        assert!(r.verified.files.is_empty());
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //!
 //! [safety]
 //! allow-unsandboxed = false
-//! deny-paths = ["~/.aws"]       # extra paths that must not be readable (M3)
+//! deny-paths = ["~/.aws"]       # extra paths that must not be readable
 //!
 //! [[project]]                   # repeatable; default: one project at "."
 //! path = "apps/web"             # relative to the config file
@@ -126,7 +126,7 @@ pub struct IgnoreRule {
 pub struct SafetyConfig {
     /// Run builds even if safety checks fail (`--allow-unsandboxed`).
     pub allow_unsandboxed: bool,
-    /// Extra paths that must not be readable; `~/` is expanded by M3.
+    /// Extra paths that must not be readable (`~/` is expanded).
     pub deny_paths: Vec<String>,
 }
 

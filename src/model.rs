@@ -11,7 +11,7 @@
 //! Config files (`mendr.toml`) use kebab-case keys; [`Strategy`] additionally
 //! accepts the kebab-case spelling (`"direct-bump"`) when deserializing.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -239,15 +239,6 @@ impl DepGraph {
         let n = &self.nodes[id];
         format!("{}@{}", n.name, n.version)
     }
-
-    /// Map from package name to all node ids with that name.
-    pub fn by_name(&self) -> HashMap<&str, Vec<NodeId>> {
-        let mut map: HashMap<&str, Vec<NodeId>> = HashMap::new();
-        for (id, n) in self.nodes.iter().enumerate() {
-            map.entry(n.name.as_str()).or_default().push(id);
-        }
-        map
-    }
 }
 
 /// How big a version change is, as defined by the ecosystem
@@ -392,7 +383,8 @@ pub enum Outcome {
 
 impl Outcome {
     /// Short stable label: `"planned"`, `"fixed"`, `"skipped:<reason>"`,
-    /// `"failed:<reason>"`. Used by `expected.json`.
+    /// `"failed:<reason>"` (the format of `expected.json`).
+    #[cfg(test)]
     pub fn label(&self) -> String {
         match self {
             Outcome::Planned { .. } => "planned".into(),
