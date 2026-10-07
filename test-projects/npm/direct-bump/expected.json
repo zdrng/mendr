@@ -1,0 +1,15 @@
+{
+  "mode": "plan",
+  "exit_code": 0,
+  "findings": [
+    {
+      "advisory": "GHSA-896r-f27r-55mw",
+      "package": "json-schema",
+      "version": "0.2.3",
+      "via": "jsprim",
+      "strategy": "direct_bump",
+      "target": { "package": "jsprim", "to": "1.4.2" },
+      "outcome": "planned"
+    }
+  ]
+}

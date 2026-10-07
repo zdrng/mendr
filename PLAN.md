@@ -146,6 +146,24 @@ tags: `{"kind": "skipped", "reason": {"kind": "no_parent_version_fixes", ...}}`.
   2026-10); the crates.io API (1 req/s) is only a fallback. Registry responses are cached for 1h
   (`cargo-index`, `crates-io` cache namespaces).
 
+- npm (`src/ecosystem/npm/`):
+  - relock = delete the lockfile entries of `package@from`, then `npm install --package-lock-only`;
+    npm re-resolves exactly those copies to the newest version their parents allow (before the
+    release cutoff), so the result may be above `to`.
+  - override = `"overrides": {"<package>@<from> - <to>": "<to>"}`. npm 10 silently ignores a
+    keyed override whose key range does not also match the replacement (`"pkg@1.2.3"` alone does
+    nothing); the hyphen range scopes the override to the vulnerable line.
+  - direct bump keeps the range style (`^1.2.3` → `^1.4.0`, `~`, `>=`, exact, `npm:` aliases) in
+    every local `package.json` (root, workspaces) whose dependency resolves to `package@from`;
+    other ranges are kept if they already allow `to` (plus a relock), else become `^to`; tags,
+    URLs, git and `file:` specs → `manifest_not_editable`.
+  - Default install is `npm ci` *with* install scripts (verification runs project code anyway and
+    many packages need their scripts); build/test run only if `scripts.build` / a real
+    `scripts.test` exist. Override per project with `install = "npm ci --ignore-scripts"`.
+  - npm has no yanking; `deprecated` versions are *not* treated as yanked (most old fixed
+    releases are deprecated). Bundled dependencies are not part of the graph.
+  - serde_json's `preserve_order` feature is enabled crate-wide so manifest rewrites keep key order.
+
 ### Verification and safety (M3)
 
 - Changes are applied **cumulatively** in one temp copy, in `plan.changes` order: each change is
@@ -269,15 +287,17 @@ Constraints to keep in mind:
 - [x] `report.rs`: Markdown output
 
 ### M4 — npm adapter
-- [ ] Detect (`package.json` + `package-lock.json` v2/v3; yarn/pnpm → unsupported for now)
-- [ ] Graph by parsing `package-lock.json` `packages` map
-- [ ] Registry: packument (versions, deps, `time`), cached
-- [ ] Version semantics via `node-semver`
-- [ ] Apply via npm with `--package-lock-only --ignore-scripts --before=<cutoff>`
-- [ ] Override via `overrides` in `package.json`
-- [ ] Register in `src/ecosystem/mod.rs` (`pub mod npm;` + one line in `ecosystems()`)
-- [ ] Peer dependency errors → `ResolutionConflict`
-- [ ] Fixtures: `npm/relock`, `npm/direct-bump`, `npm/override`, `npm/build-break`
+- [x] Detect (`package.json` + `package-lock.json` v2/v3; yarn/pnpm → unsupported for now)
+- [x] Graph by parsing `package-lock.json` `packages` map (incl. workspaces, aliases, links)
+- [x] Registry: packument (versions, deps, `time`), cached
+- [x] Version semantics: npm's semver rules (small own port; the `node-semver` crate disagrees
+      with npm on `<=1.2`-style ranges)
+- [x] Apply via npm with `--package-lock-only --ignore-scripts --before=<cutoff>`
+- [x] Override via `overrides` in `package.json`
+- [x] Register in `src/ecosystem/mod.rs` (`pub mod npm;` + one line in `ecosystems()`)
+- [x] Peer dependency errors → `ResolutionConflict`
+- [x] Fixtures: `npm/relock`, `npm/direct-bump`, `npm/override`
+- [ ] Fixture: `npm/build-break` (full mode)
 - [ ] CI: add Node toolchain to fixture job
 
 ### M5 — Gradle adapter

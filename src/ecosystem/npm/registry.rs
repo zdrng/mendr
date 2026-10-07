@@ -1,0 +1,214 @@
+//! npm registry packuments (`GET <registry>/<name>`), reduced to what the
+//! planner needs (versions, publish times, dependencies) and cached on disk
+//! under the `npm` namespace.
+//!
+//! The full document is needed: the abbreviated "corgi" format has no
+//! per-version publish times. npm has no yanking (unpublished versions just
+//! disappear), and `deprecated` is not treated as yanked: many fixed
+//! releases of old packages are deprecated.
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::ecosystem::{AdapterError, DeclaredDep, Release};
+use crate::model::{Version, VersionReq};
+
+/// How long a cached packument is trusted.
+const MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+
+pub const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org/";
+
+/// The parsed subset of one packument.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PackageInfo {
+    pub releases: Vec<Release>,
+    /// Version -> dependencies + optional + peer dependencies.
+    pub deps: BTreeMap<String, Vec<DeclaredDep>>,
+}
+
+/// Registry base URL: `$npm_config_registry` (as npm reads it) or the
+/// public registry. `.npmrc` files are not read.
+pub fn registry_url() -> String {
+    let url = std::env::var("npm_config_registry")
+        .or_else(|_| std::env::var("NPM_CONFIG_REGISTRY"))
+        .unwrap_or_else(|_| DEFAULT_REGISTRY.to_string());
+    if url.ends_with('/') { url } else { url + "/" }
+}
+
+/// Packument URL; scoped names keep the `@` and encode the slash.
+pub fn packument_url(registry: &str, name: &str) -> String {
+    format!("{registry}{}", name.replace('/', "%2f"))
+}
+
+/// Fetch (or load from cache) the info for `name`.
+pub fn fetch(name: &str) -> Result<PackageInfo, AdapterError> {
+    let registry = registry_url();
+    let key = format!("{registry}{name}");
+    if let Some(text) = crate::cache::read("npm", &key, Some(MAX_AGE))
+        && let Ok(info) = serde_json::from_str(&text)
+    {
+        return Ok(info);
+    }
+    let url = packument_url(&registry, name);
+    let body =
+        crate::http::get_string(&url, &[("Accept", "application/json")]).map_err(|e| match e {
+            crate::http::HttpError::NotFound(_) => AdapterError::NotFound(name.to_string()),
+            other => other.into(),
+        })?;
+    let info = parse(name, &body)?;
+    if let Ok(text) = serde_json::to_string(&info) {
+        crate::cache::write("npm", &key, &text);
+    }
+    Ok(info)
+}
+
+#[derive(Deserialize)]
+struct Packument {
+    #[serde(default)]
+    versions: BTreeMap<String, Manifest>,
+    #[serde(default)]
+    time: BTreeMap<String, Value>,
+}
+
+/// Dependency maps are kept as raw JSON: ancient packuments contain
+/// malformed ones (arrays, non-string values) that must not fail the parse.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Manifest {
+    dependencies: Option<Value>,
+    optional_dependencies: Option<Value>,
+    peer_dependencies: Option<Value>,
+    peer_dependencies_meta: Option<Value>,
+}
+
+fn string_map(v: &Option<Value>) -> Vec<(String, String)> {
+    v.as_ref()
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+        .collect()
+}
+
+/// Dependencies a consumer resolves. A name in both `dependencies` and
+/// `optionalDependencies` is optional (npm's rule); peers are optional when
+/// `peerDependenciesMeta.<name>.optional` is set.
+fn declared(m: &Manifest) -> Vec<DeclaredDep> {
+    let optional = string_map(&m.optional_dependencies);
+    let mut out: Vec<DeclaredDep> = Vec::new();
+    let mut push = |name: String, req: String, optional: bool| {
+        if !out.iter().any(|d| d.name == name) {
+            out.push(DeclaredDep {
+                name,
+                req: VersionReq::new(req),
+                optional,
+            });
+        }
+    };
+    for (name, req) in optional.iter().cloned() {
+        push(name, req, true);
+    }
+    for (name, req) in string_map(&m.dependencies) {
+        push(name, req, false);
+    }
+    for (name, req) in string_map(&m.peer_dependencies) {
+        let optional = m
+            .peer_dependencies_meta
+            .as_ref()
+            .and_then(|meta| meta.get(&name)?.get("optional")?.as_bool())
+            .unwrap_or(false);
+        push(name, req, optional);
+    }
+    out
+}
+
+pub fn parse(name: &str, body: &str) -> Result<PackageInfo, AdapterError> {
+    let doc: Packument = serde_json::from_str(body).map_err(|e| AdapterError::Parse {
+        what: format!("npm packument for {name}"),
+        message: e.to_string(),
+    })?;
+    let mut info = PackageInfo::default();
+    for (version, manifest) in &doc.versions {
+        let published_at = doc
+            .time
+            .get(version)
+            .and_then(Value::as_str)
+            .and_then(|t| t.parse::<jiff::Timestamp>().ok());
+        info.releases.push(Release {
+            version: Version::new(version),
+            published_at,
+            yanked: false,
+        });
+        info.deps.insert(version.clone(), declared(manifest));
+    }
+    Ok(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_packument_subset() {
+        let body = r#"{
+          "name": "p",
+          "versions": {
+            "1.0.0": {"dependencies": {"a": "^1", "o": "~2"}, "optionalDependencies": {"o": "~2"},
+                      "devDependencies": {"never": "1"}},
+            "1.1.0": {"dependencies": ["legacy", "array"],
+                      "peerDependencies": {"r": ">=16", "s": "*"},
+                      "peerDependenciesMeta": {"s": {"optional": true}}},
+            "2.0.0-rc.1": {"deprecated": "do not use"}
+          },
+          "time": {"created": "2014-01-01T00:00:00.000Z", "1.0.0": "2014-05-04T19:23:43.633Z",
+                   "1.1.0": "2015-01-01T00:00:00Z", "unpublished": {"time": "x"}}
+        }"#;
+        let info = parse("p", body).unwrap();
+        let versions: Vec<&str> = info.releases.iter().map(|r| r.version.as_str()).collect();
+        assert_eq!(versions, ["1.0.0", "1.1.0", "2.0.0-rc.1"]);
+        assert_eq!(
+            info.releases[0].published_at,
+            Some("2014-05-04T19:23:43.633Z".parse().unwrap())
+        );
+        assert_eq!(info.releases[2].published_at, None);
+        assert!(info.releases.iter().all(|r| !r.yanked));
+
+        let deps = |v: &str| -> Vec<(String, String, bool)> {
+            info.deps[v]
+                .iter()
+                .map(|d| (d.name.clone(), d.req.to_string(), d.optional))
+                .collect()
+        };
+        assert_eq!(
+            deps("1.0.0"),
+            [
+                ("o".into(), "~2".into(), true),
+                ("a".into(), "^1".into(), false)
+            ]
+        );
+        assert_eq!(
+            deps("1.1.0"),
+            [
+                ("r".into(), ">=16".into(), false),
+                ("s".into(), "*".into(), true)
+            ]
+        );
+        assert!(deps("2.0.0-rc.1").is_empty());
+        assert!(parse("p", "<html>").is_err());
+    }
+
+    #[test]
+    fn urls() {
+        assert_eq!(
+            packument_url(DEFAULT_REGISTRY, "@scope/pkg"),
+            "https://registry.npmjs.org/@scope%2fpkg"
+        );
+        assert_eq!(
+            packument_url(DEFAULT_REGISTRY, "minimist"),
+            "https://registry.npmjs.org/minimist"
+        );
+    }
+}
