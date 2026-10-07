@@ -1,0 +1,13 @@
+{
+  "name": "mendr-fixture-npm-direct-bump",
+  "version": "1.0.0",
+  "private": true,
+  "description": "mendr fixture: jsprim pins a vulnerable json-schema; only a newer jsprim pulls in the fix",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "jsprim": "^1.4.1"
+  }
+}
