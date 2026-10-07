@@ -167,6 +167,11 @@ pub trait Ecosystem {
     /// The planner never proposes an unsupported strategy.
     fn supports(&self, strategy: Strategy) -> bool;
 
+    /// Whether every dependent of a package version uses the same copy
+    /// (Cargo), so a relock of `package@from` must satisfy every requirement
+    /// on it. `false` if each copy is re-resolved from its own parents (npm).
+    fn shared_copies(&self) -> bool;
+
     // ---- Version semantics -------------------------------------------------
 
     /// Total order on versions. Unparseable versions must still get a

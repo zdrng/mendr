@@ -4,7 +4,10 @@
 //!
 //! 1. Splits the paths to `P` by **via**: the first registry package on the
 //!    path, i.e. the dependency a local manifest declares (`via == P` when
-//!    `P` itself is direct). Each `(advisory, P@v, via)` is one [`Finding`].
+//!    `P` itself is direct). Each `(advisory, P@v, via)` is one [`Finding`]
+//!    with up to [`MAX_PATHS`] of its paths. Only a via declared by a root
+//!    (the project's own manifests, not a path/git dependency's) can be
+//!    bumped.
 //! 2. Classifies advisories: active `[[ignore]]` -> `skipped:ignored`; below
 //!    `min-severity` -> `skipped:below_min_severity`.
 //! 3. Computes fix candidates for `P`: released versions > `v`, not yanked,
@@ -13,7 +16,8 @@
 //!    `skipped:no_patched_version`.
 //! 4. Tries the policy's strategies in order, first success wins:
 //!    - **relock**: some candidate satisfies every parent requirement of `P`
-//!      inside the via group -> `Change::Relock`.
+//!      inside the via group (of every parent of `P` if the ecosystem has
+//!      `shared_copies`, e.g. Cargo) -> `Change::Relock`.
 //!    - **direct bump**: if `via == P`, bump `P` to a candidate. Otherwise walk
 //!      newer versions of `via` ascending and pick the first that is not
 //!      affected by an advisory for `via` itself and whose dependency subtree
@@ -30,7 +34,8 @@
 //!    `strategy_unsupported`, else `no_parent_version_fixes`.
 //! 6. Merges changes: same `(package, from)` relocks/bumps collapse into one
 //!    change with the highest `to` (a bump wins over a relock); same for
-//!    overrides. Findings point at the merged change.
+//!    overrides. Findings point at the merged change. A merged bump/override
+//!    that became major without `allow-major` -> `skipped:major_bump_blocked`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -51,8 +56,6 @@ pub const MAX_PATHS: usize = 5;
 pub const MAX_CANDIDATES: usize = 200;
 /// Max depth of the registry subtree walk below a direct dependency.
 pub const MAX_DEPTH: usize = 8;
-/// Max paths enumerated per vulnerable node (before grouping).
-const MAX_PATH_ENUM: usize = 1000;
 
 /// Advisory summary embedded in a finding.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -142,14 +145,18 @@ pub fn plan(input: &PlanInput) -> ProjectPlan {
                 b.via.version.as_str(),
             ))
     });
-    let changes = merge(input.eco, &mut findings);
+    let changes = merge(input.eco, input.policy, &mut findings);
     ProjectPlan { findings, changes }
 }
 
 /// Paths to a vulnerable node that share the same direct dependency.
 struct Group {
     via: NodeId,
-    /// Requirements declared on `P` by its parents inside this group.
+    /// Whether a root (the project's own manifest) declares `via`; only then
+    /// can it be bumped.
+    editable: bool,
+    /// Requirements a relock of `P` must satisfy: those of its parents
+    /// inside this group, or of all its parents with `shared_copies`.
     parent_reqs: Vec<VersionReq>,
     /// Names of registry packages between `via` and `P` (exclusive).
     corridor: HashSet<String>,
@@ -429,36 +436,46 @@ impl<'a> Planner<'a> {
             .collect();
         vias.sort_unstable();
 
-        let all_paths = g.paths_to(p, MAX_PATH_ENUM);
+        let shared = self.eco().shared_copies();
         vias.into_iter()
             .map(|via| {
-                let (parent_reqs, corridor) = if via == p {
-                    let reqs = g
-                        .edges_to(p)
-                        .filter(|e| is_local(e.from))
-                        .map(|e| e.req.clone());
-                    (reqs.collect(), HashSet::new())
+                let reach = g.reachable_from(via);
+                let in_group = |from: NodeId| {
+                    if via == p {
+                        is_local(from)
+                    } else {
+                        !is_local(from) && reach.contains(&from)
+                    }
+                };
+                let parent_reqs = g
+                    .edges_to(p)
+                    .filter(|e| shared || in_group(e.from))
+                    .map(|e| e.req.clone())
+                    .collect();
+                let corridor = if via == p {
+                    HashSet::new()
                 } else {
-                    let reach = g.reachable_from(via);
-                    let reqs = g
-                        .edges_to(p)
-                        .filter(|e| !is_local(e.from) && reach.contains(&e.from))
-                        .map(|e| e.req.clone());
-                    let corridor = reach
+                    reach
                         .intersection(&reaching_p)
                         .filter(|&&id| id != p && id != via && !is_local(id))
                         .map(|&id| g.node(id).name.clone())
-                        .collect();
-                    (reqs.collect(), corridor)
+                        .collect()
                 };
-                let paths = all_paths
+                // Paths whose first registry package is `via`: local nodes
+                // that lead to `via`, then anything.
+                let reaching_via = g.reaching(via);
+                let paths = g
+                    .paths_to(p, MAX_PATHS, &|path, next| {
+                        next == via
+                            || path.contains(&via)
+                            || (is_local(next) && reaching_via.contains(&next))
+                    })
                     .iter()
-                    .filter(|path| path.iter().copied().find(|&id| !is_local(id)) == Some(via))
-                    .take(MAX_PATHS)
                     .map(|path| path.iter().map(|&id| g.label(id)).collect())
                     .collect();
                 Group {
                     via,
+                    editable: g.edges_to(via).any(|e| g.roots.contains(&e.from)),
                     parent_reqs,
                     corridor,
                     paths,
@@ -489,6 +506,9 @@ impl<'a> Planner<'a> {
             if !eco.supports(strategy) {
                 unsupported.get_or_insert(SkipReason::StrategyUnsupported { strategy });
                 continue;
+            }
+            if strategy == Strategy::DirectBump && !group.editable {
+                continue; // declared only by a path/git dependency
             }
             let result = match strategy {
                 Strategy::Relock => {
@@ -684,7 +704,7 @@ impl Target<'_> {
 
 /// Merge planned changes (see module docs) and rewrite findings to point at
 /// the merged change. Returns the distinct changes in order of first use.
-fn merge(eco: &dyn Ecosystem, findings: &mut [Finding]) -> Vec<Change> {
+fn merge(eco: &dyn Ecosystem, policy: &Policy, findings: &mut [Finding]) -> Vec<Change> {
     // key: (is_override, package, from)
     let mut merged: Vec<((bool, String, Version), Change)> = Vec::new();
     for f in findings.iter() {
@@ -710,6 +730,18 @@ fn merge(eco: &dyn Ecosystem, findings: &mut [Finding]) -> Vec<Change> {
             .iter()
             .find(|(k, _)| *k == key)
             .expect("merged above");
+        if major_blocked(eco, policy, m) {
+            f.strategy = None;
+            f.change = None;
+            f.outcome = Outcome::Skipped {
+                reason: SkipReason::MajorBumpBlocked {
+                    package: m.package().to_string(),
+                    from: m.from().clone(),
+                    to: m.to().clone(),
+                },
+            };
+            continue;
+        }
         f.strategy = Some(m.strategy());
         f.change = Some(m.clone());
         if let Outcome::Planned { .. } = f.outcome {
@@ -719,7 +751,19 @@ fn merge(eco: &dyn Ecosystem, findings: &mut [Finding]) -> Vec<Change> {
             };
         }
     }
-    merged.into_iter().map(|(_, c)| c).collect()
+    merged
+        .into_iter()
+        .map(|(_, c)| c)
+        .filter(|c| !major_blocked(eco, policy, c))
+        .collect()
+}
+
+/// A merged bump or override can be major although each part was not (a
+/// relock may go further than a manifest bump allows); `allow-major` still
+/// applies.
+fn major_blocked(eco: &dyn Ecosystem, policy: &Policy, c: &Change) -> bool {
+    !matches!(c, Change::Relock { .. })
+        && !rules::bump_allowed(eco.bump_kind(c.from(), c.to()), policy)
 }
 
 fn combine(eco: &dyn Ecosystem, a: &Change, b: &Change) -> Change {
@@ -1325,7 +1369,7 @@ mod tests {
     fn non_registry_nodes_are_not_scanned() {
         let mut f = Fake::new();
         let root = f.root("p", "1.0.0");
-        let local = f.graph.add_node("lib", &v("1.0.0"), true, false);
+        let local = f.root("lib", "1.0.0"); // workspace member
         f.graph.add_edge(root, local, VersionReq::new("*"));
         f.dep(local, "q", "1.0.0", "=1.0.0");
         f.publish("q", "1.0.0", &[]);
@@ -1340,6 +1384,157 @@ mod tests {
         assert_eq!(finding.package, "q");
         assert_eq!(finding.via.name, "q");
         assert_eq!(finding.strategy, Some(Strategy::DirectBump));
-        assert_eq!(finding.paths, vec![vec!["p@1.0.0", "lib@1.0.0", "q@1.0.0"]]);
+        assert_eq!(
+            finding.paths,
+            vec![
+                vec!["p@1.0.0", "lib@1.0.0", "q@1.0.0"],
+                vec!["lib@1.0.0", "q@1.0.0"]
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_copies_relock_must_satisfy_every_parent() {
+        // p reached via a (^1.0) and via b (=1.0.0): one shared p@1.0.0.
+        let mut f = transitive("^1.0");
+        let root = f.graph.roots[0];
+        let p = f.graph.find("p", &v("1.0.0")).unwrap();
+        let b = f.dep(root, "b", "1.0.0", "^1");
+        f.graph.add_edge(b, p, VersionReq::new("=1.0.0"));
+        f.publish("b", "1.0.0", &[("p", "=1.0.0")]);
+        f.publish("b", "1.0.1", &[("p", "^1.0.1")]);
+        f.unsupported = vec![Strategy::Override];
+        f.shared_copies = true;
+        let plan = run(&f, &[adv("A-1", "p", "0", "1.0.1")], &policy());
+        let outcomes: Vec<(&str, String)> = plan
+            .findings
+            .iter()
+            .map(|f| (f.via.name.as_str(), f.outcome.label()))
+            .collect();
+        // b's `=1.0.0` blocks moving the shared copy for a.
+        assert_eq!(
+            outcomes,
+            vec![
+                ("a", "skipped:no_parent_version_fixes".to_string()),
+                ("b", "planned".to_string())
+            ]
+        );
+        assert_eq!(plan.findings[1].strategy, Some(Strategy::DirectBump));
+    }
+
+    #[test]
+    fn via_declared_only_by_a_git_dependency_is_not_bumped() {
+        // app -> gitdep (not from the registry, not a member) -> a -> p.
+        let mut f = Fake::new();
+        let root = f.root("app", "0.1.0");
+        let git = f.graph.add_node("gitdep", &v("0.3.0"), true, false);
+        f.graph.add_edge(root, git, VersionReq::new("*"));
+        let a = f.dep(git, "a", "1.0.0", "^1");
+        f.dep(a, "p", "1.0.0", "=1.0.0");
+        f.publish("a", "1.0.0", &[("p", "=1.0.0")]);
+        f.publish("a", "1.1.0", &[("p", "^1.0.1")]);
+        f.publish("p", "1.0.0", &[]).publish("p", "1.0.1", &[]);
+        let plan = run(&f, &[adv("A-1", "p", "0", "1.0.1")], &policy());
+        let finding = only(&plan);
+        assert_eq!(finding.via.name, "a");
+        assert_eq!(
+            finding.paths,
+            vec![vec!["app@0.1.0", "gitdep@0.3.0", "a@1.0.0", "p@1.0.0"]]
+        );
+        assert_eq!(
+            finding.change,
+            Some(Change::Override {
+                package: "p".into(),
+                from: v("1.0.0"),
+                to: v("1.0.1")
+            })
+        );
+    }
+
+    #[test]
+    fn merged_major_bump_respects_allow_major() {
+        let finding = |via: &str, change: Change| Finding {
+            advisory: (&adv("A-1", "p", "0", "2.0.0")).into(),
+            package: "p".into(),
+            version: v("1.0.0"),
+            via: PackageRef {
+                name: via.into(),
+                version: v("1.0.0"),
+            },
+            paths: Vec::new(),
+            strategy: Some(change.strategy()),
+            outcome: Outcome::Planned {
+                strategy: change.strategy(),
+                change: change.clone(),
+            },
+            change: Some(change),
+        };
+        // A relock allowed by a's range, and a minor bump of the direct p.
+        let findings = || {
+            let relock = Change::Relock {
+                package: "p".into(),
+                from: v("1.0.0"),
+                to: v("2.0.0"),
+            };
+            let bump = Change::DirectBump {
+                package: "p".into(),
+                from: v("1.0.0"),
+                to: v("1.1.0"),
+                bump: BumpKind::Minor,
+            };
+            vec![finding("a", relock), finding("p", bump)]
+        };
+        let f = Fake::new();
+        let mut blocked = findings();
+        assert!(merge(&f, &policy(), &mut blocked).is_empty());
+        for finding in &blocked {
+            assert_eq!(
+                skip_reason(finding),
+                &SkipReason::MajorBumpBlocked {
+                    package: "p".into(),
+                    from: v("1.0.0"),
+                    to: v("2.0.0")
+                }
+            );
+            assert_eq!((&finding.change, finding.strategy), (&None, None));
+        }
+
+        let mut pol = policy();
+        pol.allow_major = true;
+        assert_eq!(
+            merge(&f, &pol, &mut findings()),
+            vec![Change::DirectBump {
+                package: "p".into(),
+                from: v("1.0.0"),
+                to: v("2.0.0"),
+                bump: BumpKind::Major
+            }]
+        );
+    }
+
+    #[test]
+    fn every_via_gets_paths() {
+        // Over 1000 paths through a (10 diamonds), then one through b.
+        let mut f = Fake::new();
+        let root = f.root("app", "0.1.0");
+        let mut last = f.dep(root, "a", "1.0.0", "^1");
+        for i in 0..10 {
+            let l = f.dep(last, &format!("l{i}"), "1.0.0", "^1");
+            let r = f.dep(last, &format!("r{i}"), "1.0.0", "^1");
+            let m = f.dep(l, &format!("m{i}"), "1.0.0", "^1");
+            f.graph.add_edge(r, m, VersionReq::new("^1"));
+            last = m;
+        }
+        f.dep(last, "p", "1.0.0", "^1");
+        let b = f.dep(root, "b", "1.0.0", "^1");
+        f.dep(b, "p", "1.0.0", "^1");
+        f.publish("p", "1.0.0", &[]);
+        let plan = run(&f, &[adv("A-1", "p", "0", "9.0.0")], &policy());
+        assert_eq!(plan.findings.len(), 2);
+        assert_eq!(plan.findings[0].paths.len(), MAX_PATHS);
+        assert_eq!(
+            plan.findings[1].paths,
+            vec![vec!["app@0.1.0", "b@1.0.0", "p@1.0.0"]]
+        );
     }
 }

@@ -113,9 +113,14 @@ tags: `{"kind": "skipped", "reason": {"kind": "no_parent_version_fixes", ...}}`.
 
 - A finding is one advisory × one vulnerable package version × one **via** (the first registry
   package on the path = the dependency a local manifest declares). The same vulnerable package
-  reached through two direct dependencies gives two findings, each with its own fix.
-- Fix candidates: newer, non-yanked, non-prerelease versions not affected by *any* advisory for
-  the package. Strategy order comes from `policy.strategies`; first success wins.
+  reached through two direct dependencies gives two findings, each with its own fix. Only a via
+  declared by a root / workspace member is a direct-bump target (not one declared only by a
+  path/git dependency). Up to 5 paths are reported per finding.
+- Relock: a candidate must satisfy the requirements of `P`'s parents in the via group; with
+  `Ecosystem::shared_copies` (Cargo: one copy per version) those of every parent of `P`.
+- Fix candidates: newer, non-yanked, non-prerelease versions not affected by any advisory for
+  the package that is neither ignored nor below `min-severity`. Direct-bump candidates of the via
+  must not be affected by the via's own advisories. Strategy order comes from `policy.strategies`; first success wins.
 - Direct bump search walks newer versions of the via package ascending and follows only the
   dependencies that lead to the vulnerable package in the current graph (memoized, depth ≤ 8,
   ≤ 200 candidates), resolving each to its highest matching version. Verification's rescan
@@ -123,7 +128,8 @@ tags: `{"kind": "skipped", "reason": {"kind": "no_parent_version_fixes", ...}}`.
 - When nothing works the reason is: first policy block (`major_bump_blocked`,
   `release_too_recent`), else `no_parent_version_fixes`, else `strategy_unsupported`. So a Cargo
   "no-fix" scenario reports `no_parent_version_fixes` (override unsupported is implied).
-- Changes are merged per `(package, from)`: highest `to` wins, a bump absorbs a relock.
+- Changes are merged per `(package, from)`: highest `to` wins, a bump absorbs a relock. A merged
+  bump/override that became major without `allow-major` -> `major_bump_blocked`.
 - `min-release-age`: a version without a known publish date counts as too new (fail closed);
   adapters must report publish dates.
 - Unknown severity always passes `min-severity`.

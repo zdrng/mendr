@@ -713,6 +713,10 @@ impl Ecosystem for Cargo {
         strategy != Strategy::Override
     }
 
+    fn shared_copies(&self) -> bool {
+        true
+    }
+
     fn compare(&self, a: &Version, b: &Version) -> Ordering {
         compare_versions(a.as_str(), b.as_str())
     }

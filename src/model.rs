@@ -72,8 +72,9 @@ pub struct Node {
     pub name: String,
     /// The resolved (locked) version.
     pub version: Version,
-    /// `true` if some local node (a root / workspace member) declares this
-    /// package directly in its manifest.
+    /// `true` if some non-registry node (a root / workspace member, or a
+    /// path/git dependency) declares this package. Only declarations by a
+    /// root are in the project's own manifests.
     pub direct: bool,
     /// `true` if the package comes from the ecosystem's registry. `false` for
     /// the project's own packages (roots, workspace members) and for path/git
@@ -195,14 +196,20 @@ impl DepGraph {
     }
 
     /// Up to `limit` acyclic paths from any root to `target`, each starting at
-    /// a root and ending at `target`. Deterministic (edge insertion order).
-    pub fn paths_to(&self, target: NodeId, limit: usize) -> Vec<Vec<NodeId>> {
+    /// a root and ending at `target`. A path is only extended to `next` if
+    /// `keep(path, next)`. Deterministic (edge insertion order).
+    pub fn paths_to(
+        &self,
+        target: NodeId,
+        limit: usize,
+        keep: &dyn Fn(&[NodeId], NodeId) -> bool,
+    ) -> Vec<Vec<NodeId>> {
         let can_reach = self.reaching(target);
         let mut out = Vec::new();
         for &root in &self.roots {
             if can_reach.contains(&root) {
                 let mut path = vec![root];
-                self.dfs_paths(target, &can_reach, &mut path, &mut out, limit);
+                self.dfs_paths(target, &can_reach, keep, &mut path, &mut out, limit);
             }
         }
         out
@@ -212,6 +219,7 @@ impl DepGraph {
         &self,
         target: NodeId,
         can_reach: &HashSet<NodeId>,
+        keep: &dyn Fn(&[NodeId], NodeId) -> bool,
         path: &mut Vec<NodeId>,
         out: &mut Vec<Vec<NodeId>>,
         limit: usize,
@@ -226,9 +234,9 @@ impl DepGraph {
         }
         let next: Vec<NodeId> = self.edges_from(last).map(|e| e.to).collect();
         for n in next {
-            if can_reach.contains(&n) && !path.contains(&n) {
+            if can_reach.contains(&n) && !path.contains(&n) && keep(path, n) {
                 path.push(n);
-                self.dfs_paths(target, can_reach, path, out, limit);
+                self.dfs_paths(target, can_reach, keep, path, out, limit);
                 path.pop();
             }
         }
@@ -289,18 +297,20 @@ impl fmt::Display for Strategy {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Change {
-    /// Move `package` from `from` to `to` in the lockfile only. Every parent's
-    /// declared requirement already allows `to`.
+    /// Move `package` from `from` to `to` in the lockfile only. The declared
+    /// requirements of the parents that get `to` already allow it (every
+    /// parent's when the ecosystem has `Ecosystem::shared_copies`).
     Relock {
         package: String,
         from: Version,
         to: Version,
     },
-    /// Raise the declared requirement of the direct dependency `package` so it
-    /// resolves to `to` (currently locked at `from`). The adapter writes the
-    /// ecosystem's natural requirement for `to` (Cargo: `"1.2.3"`, npm: keep
-    /// the existing range operator, e.g. `"^1.2.3"`) in every local manifest
-    /// that declares `package`, then re-locks.
+    /// Raise the requirement on `package` (currently locked at `from`) in the
+    /// project's own manifests so it resolves to `to`, then re-lock. The
+    /// adapter rewrites every declaration that currently selects `from` to a
+    /// requirement for `to` in the same style (Cargo: keeps an explicit
+    /// `=`/`~`/`^`; npm: keeps the range operator, and keeps ranges that
+    /// already allow `to`).
     DirectBump {
         package: String,
         from: Version,
@@ -580,9 +590,12 @@ mod tests {
         g.add_edge(a, p, VersionReq::new("^1"));
         g.add_edge(b, p, VersionReq::new("^1"));
         g.add_edge(p, a, VersionReq::new("^1")); // cycle
-        let paths = g.paths_to(p, 10);
+        let all = |_: &[NodeId], _: NodeId| true;
+        let paths = g.paths_to(p, 10, &all);
         assert_eq!(paths, vec![vec![root, a, p], vec![root, b, p]]);
-        assert_eq!(g.paths_to(p, 1).len(), 1);
+        assert_eq!(g.paths_to(p, 1, &all).len(), 1);
+        let not_via_b = |_: &[NodeId], next: NodeId| next != b;
+        assert_eq!(g.paths_to(p, 10, &not_via_b), vec![vec![root, a, p]]);
         assert!(g.reaching(p).contains(&root));
         assert_eq!(g.label(p), "p@1.0.0");
     }

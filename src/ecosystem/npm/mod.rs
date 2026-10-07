@@ -96,6 +96,10 @@ impl Ecosystem for Npm {
         true
     }
 
+    fn shared_copies(&self) -> bool {
+        false
+    }
+
     fn compare(&self, a: &Version, b: &Version) -> Ordering {
         match (Ver::parse(a.as_str()), Ver::parse(b.as_str())) {
             (Some(x), Some(y)) => x.cmp(&y),

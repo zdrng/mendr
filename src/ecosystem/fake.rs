@@ -30,6 +30,8 @@ pub struct Fake {
     pub graph: DepGraph,
     pub registry: HashMap<String, Vec<FakeRelease>>,
     pub unsupported: Vec<Strategy>,
+    /// Returned by `shared_copies` (default `false`, like npm).
+    pub shared_copies: bool,
     /// Changes passed to `apply`, in order.
     pub applied: RefCell<Vec<Change>>,
     /// Number of registry calls (to check memoization).
@@ -224,6 +226,10 @@ impl Ecosystem for Fake {
 
     fn supports(&self, strategy: Strategy) -> bool {
         !self.unsupported.contains(&strategy)
+    }
+
+    fn shared_copies(&self) -> bool {
+        self.shared_copies
     }
 
     fn compare(&self, a: &Version, b: &Version) -> Ordering {
