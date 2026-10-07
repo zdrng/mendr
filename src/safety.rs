@@ -583,8 +583,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let sock = home.path().join("d.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // Not a listening socket. (A bound-then-dropped listener can stay
+        // alive in a child forked concurrently by another test on macOS.)
         let stale = home.path().join("stale.sock");
-        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        write(&stale, "");
 
         let mut e = env(
             home.path(),

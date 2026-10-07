@@ -277,7 +277,9 @@ fn project_markdown(out: &mut String, p: &ProjectReport) {
 
     // Details: one entry per distinct failure of a change (a baseline failure
     // is shared by all changes), plus findings without a change.
-    let mut entries: Vec<(Vec<String>, String, Option<(&str, &str)>)> = Vec::new();
+    // (subjects, explanation, (command, log tail))
+    type Entry<'r> = (Vec<String>, String, Option<(&'r str, &'r str)>);
+    let mut entries: Vec<Entry> = Vec::new();
     for f in &p.findings {
         let (subject, text, log) = match (&f.outcome, &f.change) {
             (Outcome::Failed { reason }, Some(c)) => {
