@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::{AdapterError, Commands, DeclaredDep, Ecosystem, Release};
+use super::{AdapterError, ApplyOptions, Commands, DeclaredDep, Ecosystem, Release};
 use crate::model::{BumpKind, Change, DepGraph, NodeId, Strategy, Version, VersionReq};
 
 #[derive(Clone, Debug)]
@@ -231,7 +231,12 @@ impl Ecosystem for Fake {
         Ok(self.graph.clone())
     }
 
-    fn apply(&self, _workdir: &Path, change: &Change) -> Result<(), AdapterError> {
+    fn apply(
+        &self,
+        _workdir: &Path,
+        change: &Change,
+        _opts: &ApplyOptions,
+    ) -> Result<(), AdapterError> {
         if !self.supports(change.strategy()) {
             return Err(AdapterError::Unsupported(change.strategy().to_string()));
         }

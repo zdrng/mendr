@@ -7,7 +7,7 @@
 //!    `project.timeout` per command). If anything fails, mark every finding
 //!    that has a change as `Failed { BaselineFailed }` and stop.
 //! 3. For each change in `plan.changes` (in order):
-//!    snapshot the copy -> `eco.apply(copy, change)` (error ->
+//!    snapshot the copy -> `eco.apply(copy, change, &ApplyOptions { release_cutoff })` (error ->
 //!    `AdapterError::to_fail_reason`) -> `eco.resolve_graph(copy)` ->
 //!    release-age check on every package version new in the graph diff
 //!    (`ReleaseAgePolicyViolated`) -> rescan with `osv.advisories` +

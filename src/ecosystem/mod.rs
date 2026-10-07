@@ -147,6 +147,14 @@ impl From<crate::http::HttpError> for AdapterError {
 /// (use `RefCell`/`Mutex` for memoization behind `&self`).
 ///
 /// All methods are blocking. Must stay object-safe (`Box<dyn Ecosystem>`).
+/// Options for [`Ecosystem::apply`].
+#[derive(Debug, Clone, Default)]
+pub struct ApplyOptions {
+    /// Newest publish time a resolver may pick (`now - min-release-age`).
+    /// `None` when the release-age policy is disabled.
+    pub release_cutoff: Option<jiff::Timestamp>,
+}
+
 pub trait Ecosystem {
     /// Short identifier used in config and reports: `"cargo"`, `"npm"`.
     fn name(&self) -> &'static str;
@@ -190,8 +198,14 @@ pub trait Ecosystem {
 
     /// Apply one change inside `workdir` (always a temporary copy, never the
     /// user's checkout): edit manifests and update the lockfile. Must not run
-    /// install scripts.
-    fn apply(&self, workdir: &Path, change: &Change) -> Result<(), AdapterError>;
+    /// install scripts. Adapters whose resolver can honour
+    /// `opts.release_cutoff` (e.g. `npm --before`) should pass it on.
+    fn apply(
+        &self,
+        workdir: &Path,
+        change: &Change,
+        opts: &ApplyOptions,
+    ) -> Result<(), AdapterError>;
 
     /// Default install/build/test commands for this project. Overridden per
     /// field by `[[project]]` config.
