@@ -36,7 +36,7 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
-    /// Only plan fixes; do not build or test anything.
+    /// Only plan fixes; do not build or test anything (no safety checks).
     #[arg(long)]
     plan_only: bool,
 
@@ -53,15 +53,17 @@ struct Cli {
     #[arg(long, value_name = "DIR")]
     osv_snapshot: Option<PathBuf>,
 
-    /// Allow major version bumps.
+    /// Allow major version bumps (overrides [policy] allow-major).
     #[arg(long)]
     allow_major: bool,
 
-    /// Run builds even when secrets are reachable from this environment.
+    /// Run builds even when the safety checks find secrets reachable from
+    /// this environment (overrides [safety] allow-unsandboxed).
     #[arg(long)]
     allow_unsandboxed: bool,
 
-    /// Minimum age of any version mendr picks, e.g. "7d", "12h", "0".
+    /// Minimum age of any version mendr picks, e.g. "7d", "12h", "0" (off).
+    /// Default: [policy] min-release-age, else 7d.
     #[arg(long, value_name = "DUR")]
     min_release_age: Option<String>,
 
@@ -139,15 +141,10 @@ fn ecosystem_for(project: &ProjectConfig) -> Result<Box<dyn Ecosystem>> {
     match &project.ecosystem {
         Some(name) => ecosystem::by_name(name).ok_or_else(|| anyhow!("unknown ecosystem `{name}`")),
         None => ecosystem::detect_ecosystem(&project.path).ok_or_else(|| {
-            let known = ecosystem::names();
             anyhow!(
-                "no supported project found in {} (supported: {})",
+                "no supported project with a lockfile found in {} (supported: {})",
                 project.path.display(),
-                if known.is_empty() {
-                    "none yet".to_string()
-                } else {
-                    known.join(", ")
-                }
+                ecosystem::names().join(", ")
             )
         }),
     }
