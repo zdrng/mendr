@@ -177,6 +177,8 @@ tags: `{"kind": "skipped", "reason": {"kind": "no_parent_version_fixes", ...}}`.
   kept change therefore already ran build + test with all kept changes; the combined
   install/build/test re-run happens only when a later attempt was reverted (it may have left
   state in excluded dirs). If that re-run fails, every kept change fails with its reason.
+- A change whose `package@from` is no longer locked (an earlier kept change already moved it) is
+  not applied; it is kept if the rescan shows its findings fixed, else `still_vulnerable`.
 - The copy skips top-level `copy_excludes()` and drops symlinks that do not resolve inside the
   project. Snapshots/restores also skip `copy_excludes()` and leave them as they are, so the
   install command must reconcile them (e.g. `npm ci`). Consequence: dependencies outside the

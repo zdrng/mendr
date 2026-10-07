@@ -20,7 +20,9 @@
 //!    ignored nor below `min-severity` -> `NewVulnerabilityIntroduced`) ->
 //!    install/build/test (`InstallFailed`/`BuildFailed`/`TestFailed`/`Timeout`).
 //!    Keep on success, otherwise restore the snapshot. A failing change never
-//!    stops the others.
+//!    stops the others. A change whose `package@from` is no longer in the
+//!    graph (moved by an earlier kept change) is not applied: it is kept if
+//!    the rescan shows its findings fixed, else `StillVulnerable`.
 //! 4. Because changes are applied cumulatively, the last kept change was
 //!    already built and tested together with all earlier kept ones. Only if
 //!    a later attempt was reverted (its install/build may have left state in
@@ -116,6 +118,25 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
             .iter()
             .filter(|f| matches!(&f.outcome, Outcome::Planned { change: c, .. } if c == change))
             .collect();
+        if current
+            .graph
+            .find(change.package(), change.from())
+            .is_none()
+        {
+            // An earlier kept change already moved `package@from` (same
+            // vulnerable node, or a bump that also moved it): nothing to apply.
+            match check_still_vulnerable(ctx.eco, &findings, &current) {
+                Ok(()) => {
+                    eprintln!("mendr:   already done by an earlier change");
+                    kept.push(change.clone());
+                }
+                Err(reason) => {
+                    eprintln!("mendr:   failed: {}", describe_reason(&reason));
+                    failed.insert(change.clone(), reason);
+                }
+            }
+            continue;
+        }
         copy_tree(&work, &snap, excludes, false).context("snapshotting the project copy")?;
         match try_change(ctx, osv, &work, &snap, change, &findings, &current) {
             Ok((after, changed)) => {
@@ -1132,6 +1153,37 @@ mod tests {
             })
         );
         assert_eq!(r.labels(), labels(&[("p", "failed:still_vulnerable")]));
+    }
+
+    #[test]
+    fn change_already_done_by_an_earlier_change_is_kept() {
+        // p@1.0.0 via a (^1.0: relock) and via b (=1.0.0, no newer b:
+        // override). The relock moves the shared node, so the override's
+        // p@1.0.0 is gone when its turn comes.
+        let mut s = setup();
+        let mut fake = Fake::new();
+        let root = fake.root("app", "0.1.0");
+        let a = fake.dep(root, "a", "1.0.0", "^1");
+        let p = fake.dep(a, "p", "1.0.0", "^1.0");
+        let b = fake.dep(root, "b", "1.0.0", "^1");
+        fake.graph
+            .add_edge(b, p, crate::model::VersionReq::new("=1.0.0"));
+        fake.publish("a", "1.0.0", &[("p", "^1.0")]);
+        fake.publish("b", "1.0.0", &[("p", "=1.0.0")]);
+        fake.publish("p", "1.0.0", &[]).publish("p", "1.0.1", &[]);
+        s.fake = fake;
+        let r = run(&s);
+        let strategies: Vec<_> = r.plan.changes.iter().map(Change::strategy).collect();
+        assert_eq!(
+            strategies,
+            [
+                crate::model::Strategy::Relock,
+                crate::model::Strategy::Override
+            ]
+        );
+        assert_eq!(r.labels(), labels(&[("p", "fixed"), ("p", "fixed")]));
+        assert_eq!(s.fake.applied.borrow().len(), 1, "override not applied");
+        assert_eq!(kept_lock(&r), vec!["a@1.0.0", "p@1.0.1", "b@1.0.0"]);
     }
 
     #[test]

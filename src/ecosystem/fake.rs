@@ -295,7 +295,11 @@ impl Ecosystem for Fake {
         }
         let mut graph = self.resolve_graph(workdir)?;
         let Some(id) = graph.find(&package, change.from()) else {
-            return Ok(());
+            // Like the real adapters (`cargo update -p`, npm's lockfile edit).
+            return Err(AdapterError::Other(format!(
+                "{package}@{} is not locked",
+                change.from()
+            )));
         };
         graph.nodes[id].version = change.to().clone();
         for (name, version) in self.adds_on_apply.get(&package).into_iter().flatten() {
