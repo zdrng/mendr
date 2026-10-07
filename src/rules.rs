@@ -45,8 +45,8 @@ pub enum IgnoreMatch<'a> {
     None,
     /// A rule matches and applies today.
     Active(&'a IgnoreRule),
-    /// A rule matches but expired; the advisory is handled normally and a
-    /// warning should be printed.
+    /// A rule matches but expired; the advisory is handled normally (`main`
+    /// warns once per expired rule, see [`ignore_expired`]).
     Expired(&'a IgnoreRule),
 }
 
@@ -58,12 +58,17 @@ pub fn ignore_match<'a>(
 ) -> IgnoreMatch<'a> {
     let mut expired = None;
     for rule in ignores.iter().filter(|r| advisory.has_id(&r.id)) {
-        match rule.expires {
-            Some(d) if d < today => expired = expired.or(Some(rule)),
-            _ => return IgnoreMatch::Active(rule),
+        if !ignore_expired(rule, today) {
+            return IgnoreMatch::Active(rule);
         }
+        expired = expired.or(Some(rule));
     }
     expired.map_or(IgnoreMatch::None, IgnoreMatch::Expired)
+}
+
+/// Whether `rule` no longer applies on `today` (`expires` is inclusive).
+pub fn ignore_expired(rule: &IgnoreRule, today: Date) -> bool {
+    rule.expires.is_some_and(|d| d < today)
 }
 
 /// Today's date in UTC (used for ignore expiry).
@@ -159,6 +164,9 @@ mod tests {
             ignore_match(&adv, &forever, later),
             IgnoreMatch::Active(&forever[2])
         );
+        assert!(!ignore_expired(&rules[0], today), "inclusive");
+        assert!(ignore_expired(&rules[0], later));
+        assert!(!ignore_expired(&rules[1], later), "no expiry");
         assert_eq!(
             today_from("2026-03-04T23:59:59Z"),
             jiff::civil::date(2026, 3, 4)

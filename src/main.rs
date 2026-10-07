@@ -108,6 +108,19 @@ fn run(cli: &Cli) -> Result<u8> {
         None => Osv::live(),
     };
     let now = jiff::Timestamp::now();
+    let today = rules::today(now);
+    for rule in config
+        .ignores
+        .iter()
+        .filter(|r| rules::ignore_expired(r, today))
+    {
+        eprintln!(
+            "warning: [[ignore]] entry for {} expired on {}; the advisory is reported again \
+             (renew or remove the entry)",
+            rule.id,
+            rule.expires.expect("expired rules have a date")
+        );
+    }
     let mode = if cli.plan_only {
         Mode::Plan
     } else {

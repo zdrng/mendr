@@ -8,15 +8,17 @@
 //! 2. Classifies advisories: active `[[ignore]]` -> `skipped:ignored`; below
 //!    `min-severity` -> `skipped:below_min_severity`.
 //! 3. Computes fix candidates for `P`: released versions > `v`, not yanked,
-//!    not prerelease (unless `v` is), and not affected by *any* advisory for
-//!    `P`. None -> `skipped:no_patched_version`.
+//!    not prerelease (unless `v` is), and not affected by any advisory for
+//!    `P` that is neither ignored nor below `min-severity`. None ->
+//!    `skipped:no_patched_version`.
 //! 4. Tries the policy's strategies in order, first success wins:
 //!    - **relock**: some candidate satisfies every parent requirement of `P`
 //!      inside the via group -> `Change::Relock`.
 //!    - **direct bump**: if `via == P`, bump `P` to a candidate. Otherwise walk
-//!      newer versions of `via` ascending and pick the first whose dependency
-//!      subtree can resolve to a non-vulnerable `P` (see [`Planner::subtree_ok`])
-//!      -> `Change::DirectBump`. Major bumps need `allow-major`.
+//!      newer versions of `via` ascending and pick the first that is not
+//!      affected by an advisory for `via` itself and whose dependency subtree
+//!      can resolve to a non-vulnerable `P` (see [`Planner::subtree_ok`]) ->
+//!      `Change::DirectBump`. Major bumps need `allow-major`.
 //!    - **override**: force `P` to a candidate (major needs `allow-major`).
 //!
 //!    Every picked version must pass `min-release-age`. With
@@ -273,9 +275,43 @@ impl<'a> Planner<'a> {
         Ok(chosen.ok_or(blocked))
     }
 
+    /// Why `adv` is not acted on: an active `[[ignore]]` or a severity below
+    /// `min-severity`. `None` if it counts.
+    fn skip_reason(&self, adv: &Advisory) -> Option<SkipReason> {
+        let input = self.input;
+        if let IgnoreMatch::Active(rule) =
+            rules::ignore_match(adv, input.ignores, rules::today(input.now))
+        {
+            return Some(SkipReason::Ignored {
+                reason: rule.reason.clone(),
+                expires: rule.expires.map(|d| d.to_string()),
+            });
+        }
+        if !rules::severity_ok(adv.severity, input.policy.min_severity) {
+            return Some(SkipReason::BelowMinSeverity {
+                severity: adv
+                    .severity
+                    .map(|s| s.level)
+                    .expect("unknown severity always passes"),
+                min_severity: input.policy.min_severity,
+            });
+        }
+        None
+    }
+
+    /// Advisories for `package` that count (not skipped, see
+    /// [`Planner::skip_reason`]).
+    fn active_advisories(&self, package: &str) -> Vec<&'a Advisory> {
+        let input = self.input;
+        input
+            .advisories
+            .iter()
+            .filter(|a| a.mentions(input.eco, package) && self.skip_reason(a).is_none())
+            .collect()
+    }
+
     fn findings(&mut self) -> Vec<Finding> {
         let input = self.input;
-        let today = rules::today(input.now);
         let mut out = Vec::new();
         for vn in osv::vulnerabilities_for(input.graph, input.eco, input.advisories) {
             let node = input.graph.node(vn.node);
@@ -284,38 +320,10 @@ impl<'a> Planner<'a> {
             let mut skipped = Vec::new();
             for &i in &vn.advisories {
                 let adv = &input.advisories[i];
-                match rules::ignore_match(adv, input.ignores, today) {
-                    IgnoreMatch::Active(rule) => {
-                        skipped.push((
-                            adv,
-                            SkipReason::Ignored {
-                                reason: rule.reason.clone(),
-                                expires: rule.expires.map(|d| d.to_string()),
-                            },
-                        ));
-                        continue;
-                    }
-                    IgnoreMatch::Expired(rule) => eprintln!(
-                        "warning: ignore rule for {} expired on {}; treating it as active",
-                        rule.id,
-                        rule.expires.map(|d| d.to_string()).unwrap_or_default()
-                    ),
-                    IgnoreMatch::None => {}
+                match self.skip_reason(adv) {
+                    Some(reason) => skipped.push((adv, reason)),
+                    None => active.push(adv),
                 }
-                if !rules::severity_ok(adv.severity, input.policy.min_severity) {
-                    skipped.push((
-                        adv,
-                        SkipReason::BelowMinSeverity {
-                            severity: adv
-                                .severity
-                                .map(|s| s.level)
-                                .expect("unknown severity always passes"),
-                            min_severity: input.policy.min_severity,
-                        },
-                    ));
-                    continue;
-                }
-                active.push(adv);
             }
 
             let decisions: Vec<Result<Change, Outcome>> = if active.is_empty() {
@@ -396,22 +404,16 @@ impl<'a> Planner<'a> {
         package: &'a str,
         current: &Version,
     ) -> Result<(Target<'a>, Vec<Release>), AdapterError> {
-        let input = self.input;
-        let advisories: Vec<&Advisory> = input
-            .advisories
-            .iter()
-            .filter(|a| a.mentions(input.eco, package))
-            .collect();
         let releases = self.releases(package)?;
         let target = Target {
             name: package,
-            advisories,
+            advisories: self.active_advisories(package),
             releases,
         };
         let cands = self
             .newer(&target.releases, current)
             .into_iter()
-            .filter(|r| target.is_safe(input.eco, &r.version))
+            .filter(|r| target.is_safe(self.eco(), &r.version))
             .collect();
         Ok((target, cands))
     }
@@ -522,9 +524,17 @@ impl<'a> Planner<'a> {
                         newer.truncate(MAX_CANDIDATES);
                         newer
                     };
+                    // The new version of the via must not be vulnerable itself.
+                    let via_advisories = self.active_advisories(&via.name);
                     let mut memo = HashMap::new();
                     let res = self
                         .select(&via_cands, |s, c| {
+                            if via_advisories
+                                .iter()
+                                .any(|a| a.affects(eco, &via.name, &c.version))
+                            {
+                                return Ok(Verdict::Reject);
+                            }
                             if group.via != p
                                 && !s.subtree_ok(
                                     &via.name, &c.version, group, target, 0, &mut memo,
@@ -1236,6 +1246,53 @@ mod tests {
             ]
         );
         assert!(plan.findings.iter().all(|f| f.outcome.is_resolved()));
+    }
+
+    #[test]
+    fn skipped_advisories_do_not_restrict_candidates() {
+        let mut f = transitive("^1.0");
+        f.publish("p", "1.0.2", &[]);
+        // p@1.0.1 is affected only by an ignored and a low-severity advisory.
+        let mut low = adv("LOW-1", "p", "1.0.1", "1.0.2");
+        low.severity = Some(Severity {
+            level: SeverityLevel::Low,
+            score: Some(2.0),
+        });
+        let advisories = [
+            adv("A-1", "p", "0", "1.0.1"),
+            adv("IGN-1", "p", "1.0.1", "1.0.2"),
+            low,
+        ];
+        let ignores = [IgnoreRule {
+            id: "IGN-1".into(),
+            reason: "not reachable".into(),
+            expires: None,
+        }];
+        let mut pol = policy();
+        pol.min_severity = SeverityLevel::Medium;
+        let plan = run_with(&f, &advisories, &pol, &ignores);
+        assert_eq!(only(&plan).change.as_ref().unwrap().to(), &v("1.0.1"));
+    }
+
+    #[test]
+    fn direct_bump_skips_vulnerable_versions_of_the_via() {
+        let mut f = transitive("=1.0.0");
+        f.publish("a", "1.1.0", &[("p", "^1.0.1")]); // affected by V-1
+        f.publish("a", "1.2.0", &[("p", "^1.0.1")]);
+        let advisories = [
+            adv("A-1", "p", "0", "1.0.1"),
+            adv("V-1", "a", "1.1.0", "1.2.0"),
+        ];
+        let plan = run(&f, &advisories, &policy());
+        assert_eq!(
+            only(&plan).change,
+            Some(Change::DirectBump {
+                package: "a".into(),
+                from: v("1.0.0"),
+                to: v("1.2.0"),
+                bump: BumpKind::Minor,
+            })
+        );
     }
 
     #[test]
