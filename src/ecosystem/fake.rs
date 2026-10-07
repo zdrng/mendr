@@ -5,6 +5,11 @@
 //! comma-separated comparators: `*`, `^1.2`, `~1.2.3`, `=1.0.0`, `>=1`, `>1`,
 //! `<=1`, `<2`, or a bare version (= caret, as in Cargo). Prereleases only
 //! satisfy `=` comparators.
+//!
+//! For verification tests the graph can live in a project directory:
+//! [`Fake::write_lock`] stores it as JSON in `fake.lock`, `resolve_graph(dir)`
+//! reads `dir/fake.lock` when it exists (else returns `graph`), and `apply`
+//! rewrites `workdir/fake.lock` with the changed version.
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -31,7 +36,19 @@ pub struct Fake {
     pub registry_calls: RefCell<usize>,
     /// OSV ecosystem name to report (default `"Fake"`).
     pub osv_name: Option<&'static str>,
+    /// `apply` fails with `ResolutionConflict` for changes of these packages.
+    pub conflicts: Vec<String>,
+    /// `apply` succeeds for these packages but leaves the version unchanged.
+    pub no_effect: Vec<String>,
+    /// Packages `apply` adds as dependencies of the changed package:
+    /// `package -> [(name, version)]` (a bump pulling in new transitive deps).
+    pub adds_on_apply: HashMap<String, Vec<(String, String)>>,
+    /// `release_cutoff` passed to each `apply` call.
+    pub cutoffs: RefCell<Vec<Option<jiff::Timestamp>>>,
 }
+
+/// The lockfile `resolve_graph` / `apply` use inside a project directory.
+pub const LOCKFILE: &str = "fake.lock";
 
 /// Publish date used by [`Fake::publish`]: old enough for any release-age rule.
 pub fn old_date() -> jiff::Timestamp {
@@ -57,6 +74,11 @@ impl Fake {
             .add_node(name, &Version::new(version), direct, true);
         self.graph.add_edge(from, id, VersionReq::new(req));
         id
+    }
+
+    /// Store `graph` as `dir/fake.lock`.
+    pub fn write_lock(&self, dir: &Path) {
+        write_graph(dir, &self.graph).unwrap();
     }
 
     /// Publish `name@version` (old publish date, not yanked) with deps.
@@ -93,6 +115,11 @@ impl Fake {
             });
         self
     }
+}
+
+fn write_graph(dir: &Path, graph: &DepGraph) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(graph).expect("graph is serializable");
+    std::fs::write(dir.join(LOCKFILE), json + "\n")
 }
 
 type Parsed = (u64, u64, u64, Option<String>, usize);
@@ -227,20 +254,49 @@ impl Ecosystem for Fake {
         version.as_str().contains('-')
     }
 
-    fn resolve_graph(&self, _project_dir: &Path) -> Result<DepGraph, AdapterError> {
-        Ok(self.graph.clone())
+    fn resolve_graph(&self, project_dir: &Path) -> Result<DepGraph, AdapterError> {
+        let lock = project_dir.join(LOCKFILE);
+        if !lock.is_file() {
+            return Ok(self.graph.clone());
+        }
+        let text = std::fs::read_to_string(&lock)?;
+        serde_json::from_str(&text).map_err(|e| AdapterError::Parse {
+            what: lock.display().to_string(),
+            message: e.to_string(),
+        })
     }
 
     fn apply(
         &self,
-        _workdir: &Path,
+        workdir: &Path,
         change: &Change,
-        _opts: &ApplyOptions,
+        opts: &ApplyOptions,
     ) -> Result<(), AdapterError> {
         if !self.supports(change.strategy()) {
             return Err(AdapterError::Unsupported(change.strategy().to_string()));
         }
         self.applied.borrow_mut().push(change.clone());
+        self.cutoffs.borrow_mut().push(opts.release_cutoff);
+        let package = change.package().to_string();
+        if self.conflicts.contains(&package) {
+            return Err(AdapterError::ResolutionConflict(format!(
+                "cannot move {package} to {}",
+                change.to()
+            )));
+        }
+        if self.no_effect.contains(&package) {
+            return Ok(());
+        }
+        let mut graph = self.resolve_graph(workdir)?;
+        let Some(id) = graph.find(&package, change.from()) else {
+            return Ok(());
+        };
+        graph.nodes[id].version = change.to().clone();
+        for (name, version) in self.adds_on_apply.get(&package).into_iter().flatten() {
+            let new = graph.add_node(name, &Version::new(version.as_str()), false, true);
+            graph.add_edge(id, new, VersionReq::new(format!("={version}")));
+        }
+        write_graph(workdir, &graph)?;
         Ok(())
     }
 
@@ -253,7 +309,7 @@ impl Ecosystem for Fake {
     }
 
     fn copy_excludes(&self) -> &'static [&'static str] {
-        &[]
+        &["target"]
     }
 
     fn releases(&self, package: &str) -> Result<Vec<Release>, AdapterError> {
