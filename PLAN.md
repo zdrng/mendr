@@ -45,15 +45,15 @@ src/
   ecosystem/
     mod.rs           Ecosystem trait + detection
     cargo.rs
-    npm.rs
-    gradle.rs
+    npm/             lockfile, manifest, registry, semver
+    gradle.rs        (M5)
     fake.rs          in-memory ecosystem for unit tests
 tests/
   fixtures.rs        runs the binary against every test project
 test-projects/       see below
 ```
 
-## Config (draft)
+## Config
 
 ```toml
 [policy]
@@ -212,6 +212,8 @@ test-projects/
     direct-bump/
     override/
     build-break/
+  mixed/
+    monorepo/                mendr.toml with a Cargo and an npm project, [[ignore]], --write
   gradle/
     ...                      added with the Gradle milestone
 ```
@@ -232,11 +234,17 @@ Constraints to keep in mind:
   does not treat it as part of mendr. npm fixtures must not sit under a root `package.json` with
   workspaces.
 - **Determinism.** New advisories are published all the time and would change results. Fixture runs
-  use each scenario's frozen `osv/` snapshot. A separate scheduled CI job runs against live OSV to catch drift.
+  use each scenario's frozen `osv/` snapshot. (A scheduled job against live OSV to catch drift is
+  listed under Later.)
 - **Security alerts noise.** GitHub/Dependabot will flag the intentionally vulnerable lockfiles.
   Exclude `test-projects/` from Dependabot and dismiss alerts for it.
-- **Fixtures run untrusted build scripts.** CI runs them in a container with no secrets, so mendr's
-  own safety checks pass without `--allow-unsandboxed`. This doubles as a test of the safety checks.
+- **Fixtures run untrusted build scripts.** Fixable scenarios run in full mode (build + test). CI
+  runs them on a runner VM with no secrets and Docker stopped, so mendr's own safety checks pass
+  without `--allow-unsandboxed`; this doubles as a test of the safety checks. The harness passes
+  only `PATH`, an empty `HOME`, cache dirs and the dev shell's toolchain variables (`NIX_*` except
+  `NIX_CONFIG`, `SDKROOT`, `CC`, ...; needed to link on macOS). Locally,
+  `MENDR_FIXTURE_ALLOW_UNSANDBOXED=1` adds `--allow-unsandboxed` for machines with a reachable
+  container socket. `expected.json` can check file contents after `--write` (`files`).
 - **Pick vulnerable packages carefully.** Old, well-known advisories with stable fixes, no install
   scripts, exact versions pinned in the lockfile. Verify each scenario actually reproduces.
 
@@ -282,7 +290,7 @@ Constraints to keep in mind:
 - [x] Rescan after each change → `NewVulnerabilityIntroduced`
 - [x] Release-age check on every new package version in the lockfile diff
 - [x] Combine all kept changes and verify once more (cumulative; re-run after a revert)
-- [ ] Fixtures: `cargo/build-break`, `cargo/baseline-broken`
+- [x] Fixtures: `cargo/build-break`, `cargo/baseline-broken`
 - [x] CI job: fixture tests without secrets (runner VM, no credentials, Docker stopped)
 - [x] `report.rs`: Markdown output
 
@@ -297,8 +305,8 @@ Constraints to keep in mind:
 - [x] Register in `src/ecosystem/mod.rs` (`pub mod npm;` + one line in `ecosystems()`)
 - [x] Peer dependency errors → `ResolutionConflict`
 - [x] Fixtures: `npm/relock`, `npm/direct-bump`, `npm/override`
-- [ ] Fixture: `npm/build-break` (full mode)
-- [ ] CI: add Node toolchain to fixture job
+- [x] Fixture: `npm/build-break` (full mode)
+- [x] CI: add Node toolchain to fixture job (Node 22 comes from the flake's dev shell)
 
 ### M5 — Gradle adapter
 - [ ] Graph via injected init script that dumps the resolved graph as JSON
@@ -314,3 +322,4 @@ Constraints to keep in mind:
 - [ ] yarn / pnpm support
 - [ ] SARIF output
 - [ ] `--sandbox=docker|podman` self-launch
+- [ ] Scheduled CI job: fixtures against live OSV to catch advisory drift
