@@ -18,6 +18,8 @@ use crate::model::{Version, VersionReq};
 
 /// How long a cached packument is trusted.
 const MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+/// Part of the cache key; bump when [`PackageInfo`] or its parsing changes.
+const CACHE_FORMAT: u32 = 2;
 
 pub const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org/";
 
@@ -46,7 +48,7 @@ pub fn packument_url(registry: &str, name: &str) -> String {
 /// Fetch (or load from cache) the info for `name`.
 pub fn fetch(name: &str) -> Result<PackageInfo, AdapterError> {
     let registry = registry_url();
-    let key = format!("{registry}{name}");
+    let key = format!("{registry}{name} v{CACHE_FORMAT}");
     if let Some(text) = crate::cache::read("npm", &key, Some(MAX_AGE))
         && let Ok(info) = serde_json::from_str(&text)
     {
@@ -95,18 +97,26 @@ fn string_map(v: &Option<Value>) -> Vec<(String, String)> {
 
 /// Dependencies a consumer resolves. A name in both `dependencies` and
 /// `optionalDependencies` is optional (npm's rule); peers are optional when
-/// `peerDependenciesMeta.<name>.optional` is set.
+/// `peerDependenciesMeta.<name>.optional` is set. Aliases
+/// (`"x": "npm:real@range"`) become the real package and range.
 fn declared(m: &Manifest) -> Vec<DeclaredDep> {
     let optional = string_map(&m.optional_dependencies);
+    let mut seen: Vec<String> = Vec::new();
     let mut out: Vec<DeclaredDep> = Vec::new();
-    let mut push = |name: String, req: String, optional: bool| {
-        if !out.iter().any(|d| d.name == name) {
-            out.push(DeclaredDep {
-                name,
-                req: VersionReq::new(req),
-                optional,
-            });
+    let mut push = |key: String, spec: String, optional: bool| {
+        if seen.contains(&key) {
+            return;
         }
+        let (name, req) = match super::alias(&spec) {
+            Some((name, range)) => (name.to_string(), range.to_string()),
+            None => (key.clone(), spec),
+        };
+        seen.push(key);
+        out.push(DeclaredDep {
+            name,
+            req: VersionReq::new(req),
+            optional,
+        });
     };
     for (name, req) in optional.iter().cloned() {
         push(name, req, true);
@@ -161,6 +171,8 @@ mod tests {
             "1.1.0": {"dependencies": ["legacy", "array"],
                       "peerDependencies": {"r": ">=16", "s": "*"},
                       "peerDependenciesMeta": {"s": {"optional": true}}},
+            "1.2.0": {"dependencies": {"mm": "npm:minimist@^1.2.6", "old": "npm:minimist@0.0.8",
+                                       "sx": "npm:@s/x"}},
             "2.0.0-rc.1": {"deprecated": "do not use"}
           },
           "time": {"created": "2014-01-01T00:00:00.000Z", "1.0.0": "2014-05-04T19:23:43.633Z",
@@ -168,12 +180,12 @@ mod tests {
         }"#;
         let info = parse("p", body).unwrap();
         let versions: Vec<&str> = info.releases.iter().map(|r| r.version.as_str()).collect();
-        assert_eq!(versions, ["1.0.0", "1.1.0", "2.0.0-rc.1"]);
+        assert_eq!(versions, ["1.0.0", "1.1.0", "1.2.0", "2.0.0-rc.1"]);
         assert_eq!(
             info.releases[0].published_at,
             Some("2014-05-04T19:23:43.633Z".parse().unwrap())
         );
-        assert_eq!(info.releases[2].published_at, None);
+        assert_eq!(info.releases[3].published_at, None);
         assert!(info.releases.iter().all(|r| !r.yanked));
 
         let deps = |v: &str| -> Vec<(String, String, bool)> {
@@ -194,6 +206,15 @@ mod tests {
             [
                 ("r".into(), ">=16".into(), false),
                 ("s".into(), "*".into(), true)
+            ]
+        );
+        // Aliases: real names and ranges; two aliases of one package stay.
+        assert_eq!(
+            deps("1.2.0"),
+            [
+                ("minimist".into(), "^1.2.6".into(), false),
+                ("minimist".into(), "0.0.8".into(), false),
+                ("@s/x".into(), "*".into(), false)
             ]
         );
         assert!(deps("2.0.0-rc.1").is_empty());

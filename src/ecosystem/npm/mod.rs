@@ -66,15 +66,19 @@ impl Npm {
     }
 }
 
+/// An alias spec `npm:name@range` -> `(name, range)` (`npm:name` -> `*`).
+fn alias(spec: &str) -> Option<(&str, &str)> {
+    let rest = spec.strip_prefix("npm:")?;
+    // Skip the first character: a scope's `@` is not the separator.
+    Some(match rest.get(1..).and_then(|r| r.find('@')) {
+        Some(at) => (&rest[..at + 1], &rest[at + 2..]),
+        None => (rest, "*"),
+    })
+}
+
 /// The range part of a spec: `npm:name@range` -> `range` (`npm:name` -> `*`).
 fn range_of(spec: &str) -> &str {
-    match spec.strip_prefix("npm:") {
-        Some(rest) => rest
-            .get(1..)
-            .and_then(|r| r.find('@'))
-            .map_or("*", |at| &rest[at + 2..]),
-        None => spec,
-    }
+    alias(spec).map_or(spec, |(_, range)| range)
 }
 
 impl Ecosystem for Npm {
@@ -337,15 +341,24 @@ fn run_npm(cmd: &mut Command) -> Result<(), AdapterError> {
     }))
 }
 
-/// `npm error code ERESOLVE` & co. -> [`AdapterError::ResolutionConflict`].
+/// Error line prefixes: npm >= 10, older npm.
+const ERROR_PREFIXES: [&str; 2] = ["npm error", "npm ERR!"];
+
+/// The rest of an npm error line (`npm error ...` / `npm ERR! ...`).
+fn error_line(line: &str) -> Option<&str> {
+    ERROR_PREFIXES.iter().find_map(|p| line.strip_prefix(p))
+}
+
+/// `npm error code ERESOLVE` (`npm ERR! code ERESOLVE`) & co. ->
+/// [`AdapterError::ResolutionConflict`].
 fn conflict(stderr: &str) -> Option<AdapterError> {
     let code = stderr.lines().find_map(|l| {
-        let code = l.trim().strip_prefix("npm error code ")?.trim();
+        let code = error_line(l.trim())?.trim().strip_prefix("code ")?.trim();
         CONFLICT_CODES.contains(&code).then_some(code)
     })?;
     let detail: Vec<&str> = stderr
         .lines()
-        .filter_map(|l| l.strip_prefix("npm error"))
+        .filter_map(error_line)
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.contains("complete log") && !l.contains("_logs"))
         .collect();
@@ -372,6 +385,9 @@ mod tests {
         assert!(sat("npm:minimist@^1.2.5", "1.2.8"));
         assert!(sat("npm:@s/x@~1.0.0", "1.0.3"));
         assert!(sat("npm:minimist", "1.2.8"));
+        assert_eq!(alias("npm:@s/x@~1.0.0"), Some(("@s/x", "~1.0.0")));
+        assert_eq!(alias("npm:minimist"), Some(("minimist", "*")));
+        assert_eq!(alias("^1.2.5"), None);
         assert!(!sat("github:a/b", "1.0.0"));
         assert!(!sat("^1", "not-a-version"));
 
@@ -434,6 +450,15 @@ mod tests {
         assert!(conflict("npm error code EOVERRIDE\n").is_some());
         assert!(conflict("npm error code ETARGET\n").is_some());
         assert!(conflict("npm error code E404\n").is_none());
+        // npm <= 9 spells the prefix `npm ERR!`.
+        let old = "npm ERR! code ERESOLVE\nnpm ERR! ERESOLVE could not resolve\n";
+        match conflict(old) {
+            Some(AdapterError::ResolutionConflict(d)) => {
+                assert_eq!(d, "npm ERESOLVE: code ERESOLVE\nERESOLVE could not resolve");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(conflict("npm ERR! code E404\n").is_none());
     }
 
     const LOCK: &str = r#"{
