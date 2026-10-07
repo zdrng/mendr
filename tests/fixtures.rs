@@ -8,7 +8,11 @@
 //! nix develop -c cargo test --test fixtures -- --ignored
 //! MENDR_FIXTURE=cargo/relock nix develop -c cargo test --test fixtures -- --ignored  # one scenario
 //! ```
+//!
+//! `MENDR_FIXTURE_ALLOW_UNSANDBOXED=1` passes `--allow-unsandboxed` to
+//! full-mode runs (for machines with a reachable container daemon socket).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -30,6 +34,10 @@ struct Expected {
     args: Vec<String>,
     exit_code: i32,
     findings: Vec<ExpectedFinding>,
+    /// After the run, each file (relative to the scenario) must contain
+    /// every listed string. For checking `--write`.
+    #[serde(default)]
+    files: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,8 +239,18 @@ fn run_scenario(dir: &Path) -> Result<(), String> {
     cmd.current_dir(&project)
         .args(["--format", "json", "--osv-snapshot"])
         .arg(project.join("osv"));
-    if matches!(expected.mode, Mode::Plan) {
-        cmd.arg("--plan-only");
+    match expected.mode {
+        Mode::Plan => {
+            cmd.arg("--plan-only");
+        }
+        // Escape hatch for machines where mendr's safety checks fail even in
+        // the isolated environment (e.g. a reachable /var/run/docker.sock).
+        Mode::Full
+            if std::env::var_os("MENDR_FIXTURE_ALLOW_UNSANDBOXED").is_some_and(|v| v == "1") =>
+        {
+            cmd.arg("--allow-unsandboxed");
+        }
+        Mode::Full => {}
     }
     cmd.args(&expected.args);
     // Isolated environment: no secrets, fresh HOME, shared download caches.
@@ -242,10 +260,28 @@ fn run_scenario(dir: &Path) -> Result<(), String> {
         .env("CARGO_HOME", cache.join("cargo"))
         .env("npm_config_cache", cache.join("npm"))
         .env("MENDR_CACHE_DIR", cache.join("mendr"));
-    // TLS trust roots (not secrets) so package managers can download.
-    for var in ["SSL_CERT_FILE", "NIX_SSL_CERT_FILE"] {
-        if let Some(v) = std::env::var_os(var) {
-            cmd.env(var, v);
+    // Toolchain setup from the dev shell (compiler wrappers, SDK paths, TLS
+    // trust roots), not secrets. `NIX_CONFIG` can hold access tokens.
+    for (var, value) in std::env::vars_os() {
+        let Some(name) = var.to_str() else { continue };
+        let toolchain = (name.starts_with("NIX_") && name != "NIX_CONFIG")
+            || matches!(
+                name,
+                "SSL_CERT_FILE"
+                    | "SDKROOT"
+                    | "DEVELOPER_DIR"
+                    | "MACOSX_DEPLOYMENT_TARGET"
+                    | "CC"
+                    | "CXX"
+                    | "AR"
+                    | "AS"
+                    | "LD"
+                    | "NM"
+                    | "RANLIB"
+                    | "STRIP"
+            );
+        if toolchain {
+            cmd.env(var, value);
         }
     }
 
@@ -254,7 +290,13 @@ fn run_scenario(dir: &Path) -> Result<(), String> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let report: Value = serde_json::from_str(&stdout)
         .map_err(|e| format!("report is not JSON ({e})\nstdout:\n{stdout}\nstderr:\n{stderr}"))?;
-    let problems = compare(&expected, &report, output.status.code());
+    let mut problems = compare(&expected, &report, output.status.code());
+    for (file, needles) in &expected.files {
+        let text = std::fs::read_to_string(project.join(file)).unwrap_or_default();
+        for needle in needles.iter().filter(|n| !text.contains(n.as_str())) {
+            problems.push(format!("{file} does not contain {needle:?}"));
+        }
+    }
     if problems.is_empty() {
         Ok(())
     } else {
