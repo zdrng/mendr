@@ -31,10 +31,7 @@ pub mod npm;
 
 /// All real adapters, in detection priority order (registration point 2 of 2).
 pub fn ecosystems() -> Vec<Box<dyn Ecosystem>> {
-    vec![
-        Box::new(cargo::Cargo::new()),
-        Box::new(npm::Npm::new()),
-    ]
+    vec![Box::new(cargo::Cargo::new()), Box::new(npm::Npm::new())]
 }
 
 /// The adapter whose `name()` equals `name`.
