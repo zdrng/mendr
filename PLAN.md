@@ -40,6 +40,8 @@ src/
   plan.rs            fix planning (ecosystem-agnostic)
   verify.rs          temp copy, baseline, apply, build, test, revert
   report.rs          JSON + Markdown output
+  cache.rs           on-disk cache (OSV records, adapter registry responses)
+  http.rs            blocking HTTP helpers (ureq)
   ecosystem/
     mod.rs           Ecosystem trait + detection
     cargo.rs
@@ -57,9 +59,13 @@ test-projects/       see below
 [policy]
 strategies = ["relock", "direct-bump", "override"]  # order = preference
 allow-major = false
-min-release-age = "7d"
-min-severity = "medium"
+min-release-age = "7d"       # default 7d; "0" disables
+min-severity = "medium"      # default "low" (everything)
 target = "minimal"           # or "latest-compatible"
+
+[safety]
+allow-unsandboxed = false
+deny-paths = ["~/.aws"]
 
 [[project]]
 path = "apps/web"            # ecosystem auto-detected
@@ -79,18 +85,51 @@ expires = 2026-12-31
 ```
 
 CLI overrides: `--allow-major`, `--allow-unsandboxed`, `--min-release-age <dur>`, `--plan-only`,
-`--format json|markdown`, `--osv-snapshot <dir>`.
+`--format json|markdown`, `--osv-snapshot <dir>`, `--output <file>`, `--write`, `--config <path>`.
+Without a config file mendr uses the defaults and one auto-detected project in the current
+directory. Full reference: the doc comment at the top of `src/config.rs`.
 
-## Results (draft)
+Exit codes: 0 = no unresolved findings, 1 = unresolved findings remain, 2 = error. A finding is
+resolved when it is `fixed`, `planned` (a fix exists; `--plan-only`), `skipped:ignored` or
+`skipped:below_min_severity`. By default mendr never modifies the project; `--write` copies the
+verified manifest/lockfile changes back.
 
+## Results
+
+- `Planned { strategy, change }`: a fix was planned but not verified (`--plan-only`)
 - `Fixed { strategy, change }`
 - `Skipped { reason }`: `NoPatchedVersion`, `NoParentVersionFixes`, `MajorBumpBlocked`,
-  `StrategyUnsupported`, `Ignored`
+  `StrategyUnsupported`, `ReleaseTooRecent`, `Ignored`, `BelowMinSeverity`
 - `Failed { reason }`: `BaselineFailed`, `ResolutionConflict`, `ReleaseAgePolicyViolated`,
   `InstallFailed`, `BuildFailed`, `TestFailed`, `Timeout`, `NewVulnerabilityIntroduced`,
-  `ManifestNotEditable`
+  `StillVulnerable`, `ManifestNotEditable`, `Error`
 
-Reasons carry details (exit code, log tail, offending package/version, ...).
+Reasons carry details (exit code, log tail, offending package/version, ...). JSON uses snake_case
+tags: `{"kind": "skipped", "reason": {"kind": "no_parent_version_fixes", ...}}`. Changes:
+`Relock { package, from, to }`, `DirectBump { package, from, to, bump }`,
+`Override { package, from, to }`. The report shape is documented in `src/report.rs`.
+
+## Planning decisions
+
+- A finding is one advisory × one vulnerable package version × one **via** (the first registry
+  package on the path = the dependency a local manifest declares). The same vulnerable package
+  reached through two direct dependencies gives two findings, each with its own fix.
+- Fix candidates: newer, non-yanked, non-prerelease versions not affected by *any* advisory for
+  the package. Strategy order comes from `policy.strategies`; first success wins.
+- Direct bump search walks newer versions of the via package ascending and follows only the
+  dependencies that lead to the vulnerable package in the current graph (memoized, depth ≤ 8,
+  ≤ 200 candidates), resolving each to its highest matching version. Verification's rescan
+  catches anything this approximation misses.
+- When nothing works the reason is: first policy block (`major_bump_blocked`,
+  `release_too_recent`), else `no_parent_version_fixes`, else `strategy_unsupported`. So a Cargo
+  "no-fix" scenario reports `no_parent_version_fixes` (override unsupported is implied).
+- Changes are merged per `(package, from)`: highest `to` wins, a bump absorbs a relock.
+- `min-release-age`: a version without a known publish date counts as too new (fail closed);
+  adapters must report publish dates.
+- Unknown severity always passes `min-severity`.
+- OSV: withdrawn and RustSec informational (`unmaintained`, `unsound`, ...) records are dropped;
+  aliases are merged; the primary id is the smallest non-CVE id. Severity comes from the CVSS v3
+  vector, else `database_specific.severity`.
 
 ## Test projects
 
@@ -99,7 +138,6 @@ ecosystem, so each strategy and each failure reason is covered:
 
 ```
 test-projects/
-  osv-snapshot/              frozen OSV advisories used by fixture runs (deterministic)
   cargo/
     relock/                  vulnerable transitive dep, fixed version is in range
     direct-bump/             fix requires bumping the direct dep
@@ -115,10 +153,15 @@ test-projects/
     ...                      added with the Gradle milestone
 ```
 
-Each scenario contains the project (with its **committed lockfile**) and an `expected.json`.
-`tests/fixtures.rs` copies each scenario to a temp dir, runs `mendr --format json` with
-`--osv-snapshot`, and compares only stable fields (advisory ID, package, strategy, target version,
-outcome kind). Log tails and timestamps are ignored.
+Each scenario contains the project (with its **committed lockfile**), an `osv/` directory with
+the OSV records it needs (per-scenario snapshot: deterministic, and no shared files between
+scenarios), an optional `mendr.toml`, and an `expected.json`. `tests/fixtures.rs` discovers every
+directory with an `expected.json`, copies it to a temp dir, runs `mendr --format json
+--osv-snapshot <copy>/osv` in an isolated environment (cleared env, fresh `HOME`, shared download
+caches under `target/fixture-cache`), and compares only stable fields (advisory ID, package,
+strategy, target version, outcome kind). Log tails and timestamps are ignored. Format and
+environment details: `test-projects/README.md`. Run with
+`nix develop -c cargo test --test fixtures -- --ignored`.
 
 Constraints to keep in mind:
 
@@ -126,7 +169,7 @@ Constraints to keep in mind:
   does not treat it as part of mendr. npm fixtures must not sit under a root `package.json` with
   workspaces.
 - **Determinism.** New advisories are published all the time and would change results. Fixture runs
-  use the frozen `osv-snapshot`. A separate scheduled CI job runs against live OSV to catch drift.
+  use each scenario's frozen `osv/` snapshot. A separate scheduled CI job runs against live OSV to catch drift.
 - **Security alerts noise.** GitHub/Dependabot will flag the intentionally vulnerable lockfiles.
   Exclude `test-projects/` from Dependabot and dismiss alerts for it.
 - **Fixtures run untrusted build scripts.** CI runs them in a container with no secrets, so mendr's
@@ -137,21 +180,24 @@ Constraints to keep in mind:
 ## Milestones
 
 ### M0 — Setup
-- [ ] `cargo init`, add clap, serde, serde_json, toml, toml_edit, semver, ureq, thiserror, anyhow
-- [ ] CI: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`
-- [ ] Dependabot exclusion for `test-projects/`
+- [x] `cargo init`, add clap, serde, serde_json, toml, toml_edit, semver, ureq, thiserror, anyhow
+      (+ jiff for timestamps/dates, tempfile)
+- [x] CI: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`
+- [x] Dependabot exclusion for `test-projects/`
 
 ### M1 — Core (no real ecosystem yet)
-- [ ] `model.rs`: Version, VersionReq, DepGraph, Change, Outcome, reasons (serde-serializable)
-- [ ] `config.rs`: parse `mendr.toml`, apply flag overrides, validate
-- [ ] `osv.rs`: query OSV API, load snapshot dir, local cache
-- [ ] `osv.rs`: range matching (`introduced` / `fixed` / `last_affected`), alias dedupe, skip withdrawn
-- [ ] `rules.rs`: release age, major bump, severity threshold, ignore list with expiry
-- [ ] `ecosystem/mod.rs`: `Ecosystem` trait
-- [ ] `ecosystem/fake.rs`: in-memory graph + registry
-- [ ] `plan.rs`: relock / direct bump / override decision, recursive parent search, merge per direct dep
-- [ ] Unit tests for planner and rules using the fake ecosystem
-- [ ] `report.rs`: JSON output
+- [x] `model.rs`: Version, VersionReq, DepGraph, Change, Outcome, reasons (serde-serializable)
+- [x] `config.rs`: parse `mendr.toml`, apply flag overrides, validate
+- [x] `osv.rs`: query OSV API, load snapshot dir, local cache
+- [x] `osv.rs`: range matching (`introduced` / `fixed` / `last_affected`), alias dedupe, skip withdrawn
+- [x] `rules.rs`: release age, major bump, severity threshold, ignore list with expiry
+- [x] `ecosystem/mod.rs`: `Ecosystem` trait
+- [x] `ecosystem/fake.rs`: in-memory graph + registry
+- [x] `plan.rs`: relock / direct bump / override decision, recursive parent search, merge per direct dep
+- [x] Unit tests for planner and rules using the fake ecosystem
+- [x] `report.rs`: JSON output
+- [x] `tests/fixtures.rs` harness + `test-projects/README.md` (`expected.json` format)
+- [x] `safety.rs` / `verify.rs` stubs with documented signatures (filled in by M3)
 
 ### M2 — Cargo adapter
 - [ ] Detect (`Cargo.toml` + `Cargo.lock`)
@@ -160,7 +206,9 @@ Constraints to keep in mind:
 - [ ] Version semantics via `semver` (0.x-aware bump kind)
 - [ ] Apply relock: `cargo update -p name@from --precise to`
 - [ ] Apply direct bump with `toml_edit`, including `[workspace.dependencies]` inheritance
-- [ ] Override reported as `StrategyUnsupported`
+- [ ] `supports(Override) == false` (planner then reports `no_parent_version_fixes`, or
+      `strategy_unsupported` if override is the only enabled strategy)
+- [ ] Register in `src/ecosystem/mod.rs` (`pub mod cargo;` + one line in `ecosystems()`)
 - [ ] Fixtures: `cargo/relock`, `cargo/direct-bump`, `cargo/no-fix`
 
 ### M3 — Verification and safety
@@ -182,6 +230,7 @@ Constraints to keep in mind:
 - [ ] Version semantics via `node-semver`
 - [ ] Apply via npm with `--package-lock-only --ignore-scripts --before=<cutoff>`
 - [ ] Override via `overrides` in `package.json`
+- [ ] Register in `src/ecosystem/mod.rs` (`pub mod npm;` + one line in `ecosystems()`)
 - [ ] Peer dependency errors → `ResolutionConflict`
 - [ ] Fixtures: `npm/relock`, `npm/direct-bump`, `npm/override`, `npm/build-break`
 - [ ] CI: add Node toolchain to fixture job
