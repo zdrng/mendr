@@ -11,6 +11,21 @@ MENDR_FIXTURE=cargo/relock nix develop -c cargo test --test fixtures -- --ignore
 Adding a scenario needs no harness change: any directory below
 `test-projects/` that contains an `expected.json` is a scenario.
 
+## Scenarios
+
+| scenario | mode | expected outcome |
+|----------|------|------------------|
+| `cargo/relock` | full | smallvec relocked to 1.6.1 -> `fixed` |
+| `cargo/direct-bump` | full | tempfile bumped to 3.4.0 (drops remove_dir_all) -> `fixed` |
+| `cargo/no-fix` | plan | no tempdir release fixes remove_dir_all -> `skipped:no_parent_version_fixes` |
+| `cargo/build-break` | full | only fix is time 0.2.23 (`--allow-major`), whose API breaks the code -> `failed:build_failed` |
+| `cargo/baseline-broken` | full | the project's own test fails before any change -> `failed:baseline_failed` |
+| `npm/relock` | full | minimist relocked -> `fixed` |
+| `npm/direct-bump` | full | jsprim bumped to 1.4.2 -> `fixed` |
+| `npm/override` | full | path-to-regexp overridden to 0.1.13 -> `fixed` |
+| `npm/build-break` | full | only fix is nth-check 2.0.1 (`--allow-major`), which breaks `npm test` -> `failed:test_failed` |
+| `mixed/monorepo` | full | `mendr.toml` with a Cargo and an npm project, `[[ignore]]` with and without expiry, `--write` -> `fixed` / `skipped:ignored`, files checked |
+
 ## Layout
 
 ```
@@ -25,7 +40,9 @@ test-projects/<ecosystem>/<scenario>/
 ```
 
 Each scenario carries its own `osv/` snapshot so results are deterministic and
-scenarios never share files.
+scenarios never share files. A multi-project scenario (`mixed/<scenario>/`)
+has a `mendr.toml` with `[[project]]` entries pointing at sub-directories and
+one `osv/` for all of them.
 
 Isolation rules:
 
@@ -44,11 +61,28 @@ Isolation rules:
    `env_clear()`, then only `PATH`, `HOME=<fresh empty dir>`,
    `CARGO_HOME=target/fixture-cache/cargo`,
    `npm_config_cache=target/fixture-cache/npm`,
-   `MENDR_CACHE_DIR=target/fixture-cache/mendr`, plus `SSL_CERT_FILE` /
-   `NIX_SSL_CERT_FILE` when set. The empty `HOME` is why mendr's safety checks
-   pass without `--allow-unsandboxed`.
+   `MENDR_CACHE_DIR=target/fixture-cache/mendr`, plus the dev shell's
+   toolchain variables when set: `NIX_*` (except `NIX_CONFIG`, which can hold
+   tokens), `SSL_CERT_FILE`, `SDKROOT`, `DEVELOPER_DIR`,
+   `MACOSX_DEPLOYMENT_TARGET`, `CC`, `CXX`, `AR`, `AS`, `LD`, `NM`, `RANLIB`,
+   `STRIP` (needed to link on macOS). The empty `HOME` and cleared
+   environment are why mendr's safety checks pass without
+   `--allow-unsandboxed`.
 3. The exit code and the findings in the JSON report are compared with
-   `expected.json`.
+   `expected.json`, then the `files` expectations are checked in the copy.
+
+Full-mode scenarios run real builds, so mendr's safety checks apply. The one
+check the harness cannot isolate is a container daemon socket
+(`/var/run/docker.sock`, `/run/podman/podman.sock`) that is reachable on the
+machine: mendr then refuses (exit 2). Stop the daemon, or opt in explicitly
+for local runs:
+
+```sh
+MENDR_FIXTURE_ALLOW_UNSANDBOXED=1 nix develop -c cargo test --test fixtures -- --ignored
+```
+
+With `MENDR_FIXTURE_ALLOW_UNSANDBOXED=1` the harness passes
+`--allow-unsandboxed` to full-mode runs. CI never sets it.
 
 ## `expected.json`
 
@@ -77,6 +111,7 @@ Isolation rules:
 | `args`      | no       | extra CLI arguments |
 | `exit_code` | yes      | 0 = nothing unresolved, 1 = unresolved findings remain, 2 = error |
 | `findings`  | yes      | the **complete** list of expected findings (extra findings fail the test) |
+| `files`     | no       | `{"<path>": ["text", ...]}`: after the run, each file (relative to the scenario) must contain every string; use with `"args": ["--write"]` |
 
 Per finding:
 

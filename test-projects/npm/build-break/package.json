@@ -1,0 +1,13 @@
+{
+  "name": "mendr-fixture-npm-build-break",
+  "version": "1.0.0",
+  "private": true,
+  "description": "mendr fixture: the only fix for nth-check is 2.x, whose CommonJS export is no longer a function",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "nth-check": "^1.0.2"
+  }
+}

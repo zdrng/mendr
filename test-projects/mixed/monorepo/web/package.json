@@ -1,0 +1,14 @@
+{
+  "name": "mendr-fixture-mixed-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "mendr fixture: npm half of a two-project repo (jsprim needs a direct bump; minimist is ignored in mendr.toml)",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "jsprim": "^1.4.1",
+    "mkdirp": "^0.5.5"
+  }
+}

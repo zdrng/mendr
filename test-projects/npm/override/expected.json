@@ -1,5 +1,5 @@
 {
-  "mode": "plan",
+  "mode": "full",
   "exit_code": 0,
   "findings": [
     {
@@ -9,7 +9,7 @@
       "via": "router",
       "strategy": "override",
       "target": { "package": "path-to-regexp", "to": "0.1.13" },
-      "outcome": "planned"
+      "outcome": "fixed"
     },
     {
       "advisory": "GHSA-rhx6-c78j-4q9w",
@@ -18,7 +18,7 @@
       "via": "router",
       "strategy": "override",
       "target": { "package": "path-to-regexp", "to": "0.1.13" },
-      "outcome": "planned"
+      "outcome": "fixed"
     }
   ]
 }

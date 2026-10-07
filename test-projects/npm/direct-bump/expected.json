@@ -1,5 +1,5 @@
 {
-  "mode": "plan",
+  "mode": "full",
   "exit_code": 0,
   "findings": [
     {
@@ -9,7 +9,7 @@
       "via": "jsprim",
       "strategy": "direct_bump",
       "target": { "package": "jsprim", "to": "1.4.2" },
-      "outcome": "planned"
+      "outcome": "fixed"
     }
   ]
 }

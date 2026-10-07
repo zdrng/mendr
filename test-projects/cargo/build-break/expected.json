@@ -1,0 +1,16 @@
+{
+  "mode": "full",
+  "args": ["--allow-major"],
+  "exit_code": 1,
+  "findings": [
+    {
+      "advisory": "RUSTSEC-2020-0071",
+      "package": "time",
+      "version": "0.1.45",
+      "via": "time",
+      "strategy": "direct_bump",
+      "target": { "package": "time", "to": "0.2.23" },
+      "outcome": "failed:build_failed"
+    }
+  ]
+}

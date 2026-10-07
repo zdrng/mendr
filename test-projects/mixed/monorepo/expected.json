@@ -1,0 +1,36 @@
+{
+  "mode": "full",
+  "args": ["--write"],
+  "exit_code": 0,
+  "findings": [
+    {
+      "advisory": "RUSTSEC-2021-0003",
+      "package": "smallvec",
+      "version": "1.6.0",
+      "via": "smallstr",
+      "strategy": "relock",
+      "target": { "package": "smallvec", "to": "1.6.1" },
+      "outcome": "fixed"
+    },
+    {
+      "advisory": "GHSA-896r-f27r-55mw",
+      "package": "json-schema",
+      "version": "0.2.3",
+      "via": "jsprim",
+      "strategy": "direct_bump",
+      "target": { "package": "jsprim", "to": "1.4.2" },
+      "outcome": "fixed"
+    },
+    {
+      "advisory": "GHSA-xvch-5gv4-984h",
+      "package": "minimist",
+      "version": "1.2.5",
+      "via": "mkdirp",
+      "outcome": "skipped:ignored"
+    }
+  ],
+  "files": {
+    "api/Cargo.lock": ["name = \"smallvec\"\nversion = \"1.6.1\""],
+    "web/package.json": ["\"jsprim\": \"^1.4.2\""]
+  }
+}

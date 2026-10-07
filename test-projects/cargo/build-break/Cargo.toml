@@ -1,0 +1,11 @@
+[package]
+name = "build-break"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+time = "0.1.45"
+
+# Standalone: keeps Cargo from attaching this fixture to mendr's own package.
+[workspace]

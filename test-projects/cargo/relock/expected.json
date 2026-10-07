@@ -1,5 +1,5 @@
 {
-  "mode": "plan",
+  "mode": "full",
   "exit_code": 0,
   "findings": [
     {
@@ -9,7 +9,7 @@
       "via": "smallstr",
       "strategy": "relock",
       "target": { "package": "smallvec", "to": "1.6.1" },
-      "outcome": "planned"
+      "outcome": "fixed"
     }
   ]
 }

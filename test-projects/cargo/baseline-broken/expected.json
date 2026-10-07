@@ -1,0 +1,15 @@
+{
+  "mode": "full",
+  "exit_code": 1,
+  "findings": [
+    {
+      "advisory": "RUSTSEC-2021-0003",
+      "package": "smallvec",
+      "version": "1.6.0",
+      "via": "smallstr",
+      "strategy": "relock",
+      "target": { "package": "smallvec", "to": "1.6.1" },
+      "outcome": "failed:baseline_failed"
+    }
+  ]
+}

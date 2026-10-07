@@ -1,0 +1,27 @@
+# Two projects in one repository: config loading, per-project settings and
+# ignore rules with expiry, end to end.
+
+[policy]
+strategies = ["relock", "direct-bump"]
+min-release-age = "30d"
+
+[[project]]
+path = "api"                  # Cargo, auto-detected
+
+[[project]]
+path = "web"
+ecosystem = "npm"
+install = "npm ci --no-audit --no-fund --ignore-scripts"
+timeout = "10m"
+
+# Active: the minimist finding is reported as skipped:ignored.
+[[ignore]]
+id = "CVE-2021-44906"         # alias of GHSA-xvch-5gv4-984h
+reason = "mkdirp only parses trusted arguments here"
+expires = 2099-12-31
+
+# Expired: no longer applies, so smallvec is fixed.
+[[ignore]]
+id = "RUSTSEC-2021-0003"
+reason = "was waiting for the smallstr update"
+expires = 2021-06-30

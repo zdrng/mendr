@@ -1,5 +1,5 @@
 {
-  "mode": "plan",
+  "mode": "full",
   "exit_code": 0,
   "findings": [
     {
@@ -9,7 +9,7 @@
       "via": "mkdirp",
       "strategy": "relock",
       "target": { "package": "minimist", "to": "1.2.6" },
-      "outcome": "planned"
+      "outcome": "fixed"
     }
   ]
 }

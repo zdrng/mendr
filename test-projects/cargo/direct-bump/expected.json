@@ -1,5 +1,5 @@
 {
-  "mode": "plan",
+  "mode": "full",
   "exit_code": 0,
   "findings": [
     {
@@ -9,7 +9,7 @@
       "via": "tempfile",
       "strategy": "direct_bump",
       "target": { "package": "tempfile", "to": "3.4.0" },
-      "outcome": "planned"
+      "outcome": "fixed"
     }
   ]
 }
