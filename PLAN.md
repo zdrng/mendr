@@ -130,6 +130,21 @@ tags: `{"kind": "skipped", "reason": {"kind": "no_parent_version_fixes", ...}}`.
 - OSV: withdrawn and RustSec informational (`unmaintained`, `unsound`, ...) records are dropped;
   aliases are merged; the primary id is the smallest non-CVE id. Severity comes from the CVSS v3
   vector, else `database_specific.severity`.
+- Cargo graph: nodes/edges from `Cargo.lock`, members + their requirements from
+  `cargo metadata --no-deps` (no downloads, no build scripts), registry edge requirements from the
+  sparse index. Only crates.io packages are `registry` nodes; path/git/alternative-registry packages
+  are local, and edges *from* git, alternative-registry or out-of-workspace path packages get
+  requirement `*` (their manifests are not read).
+- Cargo direct bump: every workspace declaration (`[dependencies]`, dev, build, `[target.*]`,
+  renamed) whose requirement allows `from` is rewritten; `workspace = true` ones in the root's
+  `[workspace.dependencies]`. The new requirement is `to`, keeping an explicit `=`/`~`/`^`. The
+  lockfile is updated with `cargo update --workspace` (manifests temporarily pinned to `=to`).
+- Cargo ignores `ApplyOptions::release_cutoff` (stable Cargo cannot resolve by publish time), so
+  verification's release-age check on the lockfile diff is the only guard for new transitive
+  versions a Cargo change pulls in.
+- Cargo publish dates come from the sparse index `pubtime` (present on every version as of
+  2026-10); the crates.io API (1 req/s) is only a fallback. Registry responses are cached for 1h
+  (`cargo-index`, `crates-io` cache namespaces).
 
 ## Test projects
 
@@ -200,16 +215,16 @@ Constraints to keep in mind:
 - [x] `safety.rs` / `verify.rs` stubs with documented signatures (filled in by M3)
 
 ### M2 — Cargo adapter
-- [ ] Detect (`Cargo.toml` + `Cargo.lock`)
-- [ ] Graph via `cargo metadata --format-version 1`
-- [ ] Registry: sparse index (versions, deps, yanked) + crates.io API for publish dates, cached
-- [ ] Version semantics via `semver` (0.x-aware bump kind)
-- [ ] Apply relock: `cargo update -p name@from --precise to`
-- [ ] Apply direct bump with `toml_edit`, including `[workspace.dependencies]` inheritance
-- [ ] `supports(Override) == false` (planner then reports `no_parent_version_fixes`, or
+- [x] Detect (`Cargo.toml` + `Cargo.lock`)
+- [x] Graph via `Cargo.lock` + `cargo metadata --no-deps --format-version 1` + sparse index (no downloads)
+- [x] Registry: sparse index (versions, deps, yanked, `pubtime`) + crates.io API fallback for publish dates, cached
+- [x] Version semantics via `semver` (0.x-aware bump kind)
+- [x] Apply relock: `cargo update -p name@from --precise to`
+- [x] Apply direct bump with `toml_edit`, including `[workspace.dependencies]` inheritance
+- [x] `supports(Override) == false` (planner then reports `no_parent_version_fixes`, or
       `strategy_unsupported` if override is the only enabled strategy)
-- [ ] Register in `src/ecosystem/mod.rs` (`pub mod cargo;` + one line in `ecosystems()`)
-- [ ] Fixtures: `cargo/relock`, `cargo/direct-bump`, `cargo/no-fix`
+- [x] Register in `src/ecosystem/mod.rs` (`pub mod cargo;` + one line in `ecosystems()`)
+- [x] Fixtures: `cargo/relock`, `cargo/direct-bump`, `cargo/no-fix`
 
 ### M3 — Verification and safety
 - [ ] `safety.rs`: credential files, secret env vars, Docker socket, configurable deny paths
