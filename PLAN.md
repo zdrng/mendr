@@ -131,6 +131,36 @@ tags: `{"kind": "skipped", "reason": {"kind": "no_parent_version_fixes", ...}}`.
   aliases are merged; the primary id is the smallest non-CVE id. Severity comes from the CVSS v3
   vector, else `database_specific.severity`.
 
+### Verification and safety (M3)
+
+- Changes are applied **cumulatively** in one temp copy, in `plan.changes` order: each change is
+  verified on top of the changes kept so far and reverted (snapshot restore) on failure. The last
+  kept change therefore already ran build + test with all kept changes; the combined
+  install/build/test re-run happens only when a later attempt was reverted (it may have left
+  state in excluded dirs). If that re-run fails, every kept change fails with its reason.
+- The copy skips top-level `copy_excludes()` and drops symlinks that do not resolve inside the
+  project. Snapshots/restores also skip `copy_excludes()` and leave them as they are, so the
+  install command must reconcile them (e.g. `npm ci`). Consequence: dependencies outside the
+  project dir (Cargo `path = "../x"`) are missing in the copy -> `baseline_failed`; point
+  `[[project]] path` at the workspace root instead.
+- **Adapters:** `apply` must change only manifests/lockfiles inside `workdir` (no temp files
+  left behind): `--write` copies back exactly the non-excluded files `apply` changed, with
+  their content captured right after `apply` (build/test output never reaches the project).
+  `resolve_graph` runs on the copy after every `apply`; `releases()` is called for every
+  package version new in the graph (release-age check, fail closed without a publish date).
+- Rescan: `still_vulnerable` = a finding's package at its old version, or at any version its
+  advisory affects, is still reachable from a direct dependency named like its `via`.
+  `new_vulnerability_introduced` = an (advisory id/alias, package) pair not present before the
+  change, unless ignored or below `min-severity`.
+- Commands run as `sh -c` in the copy with mendr's environment, stdin `/dev/null`, stdout+stderr
+  combined into the log tail. A timeout kills the command's whole process group. A baseline
+  timeout is reported as `baseline_failed` (`exit_code: null`, log tail says "timed out").
+- Safety checks look for danger, not isolation: credential files under `HOME` and named by env
+  vars (`CARGO_HOME`, `DOCKER_CONFIG`, `KUBECONFIG`, ...), secret-looking env var names
+  (values never printed), a reachable SSH agent, a reachable Docker/Podman socket or a
+  non-unix `DOCKER_HOST`, readable `deny-paths`. CI's fixture job runs on a runner VM with no
+  checkout credentials, no Nix access token and Docker stopped.
+
 ## Test projects
 
 Small real projects with known vulnerable dependencies. One directory per **scenario**, not per
@@ -212,16 +242,16 @@ Constraints to keep in mind:
 - [ ] Fixtures: `cargo/relock`, `cargo/direct-bump`, `cargo/no-fix`
 
 ### M3 — Verification and safety
-- [ ] `safety.rs`: credential files, secret env vars, Docker socket, configurable deny paths
-- [ ] Refuse to run unless checks pass or `--allow-unsandboxed`
-- [ ] `verify.rs`: temp copy, baseline build/test, apply, build, test, keep or revert
-- [ ] Command timeouts
-- [ ] Rescan after each change → `NewVulnerabilityIntroduced`
-- [ ] Release-age check on every new package version in the lockfile diff
-- [ ] Combine all kept changes and verify once more
+- [x] `safety.rs`: credential files, secret env vars, Docker socket, configurable deny paths
+- [x] Refuse to run unless checks pass or `--allow-unsandboxed`
+- [x] `verify.rs`: temp copy, baseline build/test, apply, build, test, keep or revert
+- [x] Command timeouts
+- [x] Rescan after each change → `NewVulnerabilityIntroduced`
+- [x] Release-age check on every new package version in the lockfile diff
+- [x] Combine all kept changes and verify once more (cumulative; re-run after a revert)
 - [ ] Fixtures: `cargo/build-break`, `cargo/baseline-broken`
-- [ ] CI job: fixture tests in a container without secrets
-- [ ] `report.rs`: Markdown output
+- [x] CI job: fixture tests without secrets (runner VM, no credentials, Docker stopped)
+- [x] `report.rs`: Markdown output
 
 ### M4 — npm adapter
 - [ ] Detect (`package.json` + `package-lock.json` v2/v3; yarn/pnpm → unsupported for now)
