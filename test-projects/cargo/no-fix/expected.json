@@ -1,0 +1,13 @@
+{
+  "mode": "plan",
+  "exit_code": 1,
+  "findings": [
+    {
+      "advisory": "RUSTSEC-2023-0018",
+      "package": "remove_dir_all",
+      "version": "0.5.3",
+      "via": "tempdir",
+      "outcome": "skipped:no_parent_version_fixes"
+    }
+  ]
+}

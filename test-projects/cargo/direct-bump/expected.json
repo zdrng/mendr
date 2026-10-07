@@ -1,0 +1,15 @@
+{
+  "mode": "plan",
+  "exit_code": 0,
+  "findings": [
+    {
+      "advisory": "RUSTSEC-2023-0018",
+      "package": "remove_dir_all",
+      "version": "0.5.3",
+      "via": "tempfile",
+      "strategy": "direct_bump",
+      "target": { "package": "tempfile", "to": "3.4.0" },
+      "outcome": "planned"
+    }
+  ]
+}
