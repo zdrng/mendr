@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::{Change, DepGraph, FailReason, Strategy, Version, VersionReq};
 
 // ---- Adapter modules (registration point 1 of 2) ---------------------------
-// pub mod cargo;   // M2
+pub mod cargo;
 // pub mod npm;     // M4
 #[cfg(test)]
 pub mod fake;
@@ -32,7 +32,7 @@ pub mod fake;
 /// All real adapters, in detection priority order (registration point 2 of 2).
 pub fn ecosystems() -> Vec<Box<dyn Ecosystem>> {
     vec![
-        // Box::new(cargo::Cargo::new()),  // M2
+        Box::new(cargo::Cargo::new()),
         // Box::new(npm::Npm::new()),      // M4
     ]
 }
