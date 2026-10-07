@@ -1,0 +1,19 @@
+# Dependabot keeps mendr's own dependencies up to date.
+#
+# `test-projects/` contains intentionally vulnerable fixture projects with
+# pinned lockfiles. They must never be "fixed" by Dependabot, so every entry
+# excludes that directory. Security alerts raised for files under
+# `test-projects/` are expected and should be dismissed.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    exclude-paths:
+      - "test-projects/**"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
