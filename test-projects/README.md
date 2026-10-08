@@ -24,6 +24,10 @@ Adding a scenario needs no harness change: any directory below
 | `npm/direct-bump` | full | jsprim bumped to 1.4.2 -> `fixed` |
 | `npm/override` | full | path-to-regexp overridden to 0.1.13 -> `fixed` |
 | `npm/build-break` | full | only fix is nth-check 2.0.1 (`--allow-major`), which breaks `npm test` -> `failed:test_failed` |
+| `pnpm/relock` | full | minimist relocked to 1.2.6, `--write`: only `pnpm-lock.yaml` changes -> `fixed` |
+| `pnpm/direct-bump` | full | jsprim bumped to 1.4.2, `--write` -> `fixed`, files checked |
+| `pnpm/override` | full | path-to-regexp overridden to 0.1.13 for router 1.3.8 in `pnpm-workspace.yaml`, `--write` -> `fixed`, files checked |
+| `pnpm/build-break` | full | only fix is nth-check 2.0.1 (`--allow-major`), which breaks `pnpm test` -> `failed:test_failed` |
 | `mixed/monorepo` | full | `mendr.toml` with a Cargo and an npm project, `[[ignore]]` with and without expiry, `--write` -> `fixed` / `skipped:ignored`, files checked |
 
 ## Layout
@@ -31,7 +35,8 @@ Adding a scenario needs no harness change: any directory below
 ```
 test-projects/<ecosystem>/<scenario>/
   Cargo.toml / package.json ...  the real project
-  Cargo.lock / package-lock.json committed lockfile pinning the vulnerable version
+  Cargo.lock / package-lock.json / pnpm-lock.yaml
+                                 committed lockfile pinning the vulnerable version
   mendr.toml                     optional config
   osv/                           OSV records this scenario needs (one record per *.json file,
                                  standard osv.dev schema, e.g. saved from
@@ -48,7 +53,8 @@ Isolation rules:
 
 - Cargo fixtures declare an empty `[workspace]` table so Cargo does not treat
   them as part of mendr's workspace.
-- npm fixtures must not sit under a `package.json` with workspaces.
+- npm fixtures must not sit under a `package.json` with workspaces, pnpm fixtures not under a
+  `pnpm-workspace.yaml`.
 - Pick old, well-known advisories with stable fixes; no install scripts; exact
   versions pinned in the lockfile.
 
@@ -61,6 +67,7 @@ Isolation rules:
    `env_clear()`, then only `PATH`, `HOME=<fresh empty dir>`,
    `CARGO_HOME=target/fixture-cache/cargo`,
    `npm_config_cache=target/fixture-cache/npm`,
+   `pnpm_config_store_dir=target/fixture-cache/pnpm-store`,
    `MENDR_CACHE_DIR=target/fixture-cache/mendr`, plus the dev shell's
    toolchain variables when set: `NIX_*` (except `NIX_CONFIG`, which can hold
    tokens), `SSL_CERT_FILE`, `SDKROOT`, `DEVELOPER_DIR`,

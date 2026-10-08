@@ -316,6 +316,26 @@ Constraints to keep in mind:
 - [x] Fixture: `npm/build-break` (full mode)
 - [x] CI: add Node toolchain to fixture job (Node 22 comes from the flake's dev shell)
 
+### M4b — pnpm adapter (independent of the npm adapter)
+- [x] Detect (`package.json` + `pnpm-lock.yaml`)
+- [x] Graph by parsing `pnpm-lock.yaml` v9 `importers` / `packages` / `snapshots` (incl.
+      workspaces, links, aliases, peer variants, catalogs, pnpm 12's leading env document);
+      ranges on registry edges from the version manifests (`GET <registry>/<name>/<version>`,
+      cached forever)
+- [x] Registry: packument (versions, deps, `time`), cached under `pnpm`
+- [x] Version semantics: node-semver rules (own copy of the port)
+- [x] Apply via pnpm (>= 10) with `--lockfile-only --ignore-scripts`, a non-strict
+      `minimum-release-age` and `trust-lockfile`
+- [x] Relock by pinning the dependents for one install (parent-scoped overrides, exact importer
+      specs), then unpinning: pnpm override keys match declared ranges, so a plain
+      `pkg@from` key would also move copies at other versions
+- [x] Override via parent-scoped `overrides` in `pnpm-workspace.yaml` (pnpm >= 11 ignores
+      `pnpm.overrides` in `package.json`)
+- [x] `ERR_PNPM_NO_MATCHING_VERSION` & co. → `ResolutionConflict`
+- [x] Fixtures: `pnpm/relock`, `pnpm/direct-bump`, `pnpm/override`, `pnpm/build-break`
+- [x] pnpm in the flake's dev shell
+- [ ] Direct bumps of dependencies declared through catalogs (edit `pnpm-workspace.yaml`)
+
 ### M5 — Gradle adapter
 - [ ] Graph via injected init script that dumps the resolved graph as JSON
 - [ ] Find where a version is declared: build files, `libs.versions.toml`, `ext`, BOMs
@@ -327,7 +347,7 @@ Constraints to keep in mind:
 ### Later
 - [ ] Go adapter
 - [ ] Flutter/Dart adapter
-- [ ] yarn / pnpm support
+- [ ] yarn support
 - [ ] SARIF output
 - [ ] `--sandbox=docker|podman` self-launch
 - [ ] Scheduled CI job: fixtures against live OSV to catch advisory drift

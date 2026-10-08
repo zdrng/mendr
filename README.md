@@ -13,12 +13,15 @@ mendr never touches your checkout unless you pass `--write`.
 For each vulnerable package version, mendr takes the cheapest step the policy allows:
 
 1. **relock**: only the lockfile changes. The parent's declared range already allows a fixed
-   version (`cargo update -p smallvec@1.6.0 --precise 1.6.1`, or npm re-resolving that copy).
+   version (`cargo update -p smallvec@1.6.0 --precise 1.6.1`, npm re-resolving that copy, or
+   pnpm pinning it for one resolution).
 2. **direct bump**: raise the requirement of the direct dependency in your manifest to the
    smallest version that pulls in a fix (`tempfile = "3.3.0"` -> `"3.4.0"`), keeping the range
    style.
 3. **override**: force the fixed version through the package manager's override mechanism
-   (npm `overrides`, scoped to the vulnerable versions). Not available for Cargo.
+   (npm `overrides`, scoped to the vulnerable versions; pnpm `overrides` in
+   `pnpm-workspace.yaml`, scoped to the packages that depend on the vulnerable version). Not
+   available for Cargo.
 4. **give up with a reason**: e.g. `no_patched_version`, `no_parent_version_fixes`,
    `major_bump_blocked`, `release_too_recent`.
 
@@ -38,10 +41,10 @@ Then, unless `--plan-only`, mendr copies the project to a temp dir and:
 
 ## Install and run
 
-Toolchains come from the Nix flake (Rust, Node 22):
+Toolchains come from the Nix flake (Rust, Node 22, pnpm):
 
 ```sh
-nix develop                  # shell with cargo, node, npm
+nix develop                  # shell with cargo, node, npm, pnpm
 cargo install --path .       # or: cargo build --release && ./target/release/mendr
 ```
 
@@ -108,7 +111,7 @@ timeout = "20m"              # per command; default: none
 
 [[project]]
 path = "apps/web"
-ecosystem = "npm"            # optional: cargo | npm
+ecosystem = "npm"            # optional: cargo | npm | pnpm
 install = "npm ci --ignore-scripts"   # override the default commands per step
 build = "npm run build"
 test = "npm test"
@@ -125,6 +128,7 @@ Default commands:
 |-----------|---------|-------|------|
 | cargo | - | `cargo build --locked --all-targets` | `cargo test --locked` |
 | npm | `npm ci --no-audit --no-fund` | `npm run build` if `scripts.build` exists | `npm test` if a real `scripts.test` exists |
+| pnpm | `pnpm install --frozen-lockfile` | `pnpm run build` if `scripts.build` exists | `pnpm test` if a real `scripts.test` exists |
 
 ## Safety
 
@@ -132,7 +136,7 @@ Verification runs untrusted code: build scripts, install scripts and test suites
 dependency versions. Before building anything, mendr looks for secrets that this code could read
 and refuses to run (exit 2) if it finds any:
 
-- credential files under `HOME` (SSH private keys, `~/.aws/credentials`, `~/.npmrc` tokens,
+- credential files under `HOME` (SSH private keys, `~/.aws/credentials`, `~/.npmrc` and pnpm `rc` tokens,
   `~/.cargo/credentials.toml`, `~/.docker/config.json` auths, `~/.config/gh/hosts.yml`,
   `~/.netrc`, `~/.kube/config`, gcloud/Azure/GnuPG/PyPI/RubyGems credentials, ...) and files
   named by variables such as `CARGO_HOME`, `DOCKER_CONFIG`, `KUBECONFIG`,
@@ -168,6 +172,7 @@ warning). The checks look for danger; they cannot prove isolation.
 |-----------|-------------|------------|
 | Cargo | `Cargo.toml` + `Cargo.lock` | relock, direct bump (incl. `[workspace.dependencies]`) |
 | npm | `package.json` + `package-lock.json` (v2/v3) or `npm-shrinkwrap.json` | relock, direct bump, override (incl. workspaces) |
+| pnpm | `package.json` + `pnpm-lock.yaml` (v9) | relock, direct bump, override (incl. workspaces) |
 
 Limitations:
 
@@ -179,7 +184,14 @@ Limitations:
   `[[project]] path` at the workspace root.
 - npm: the registry is `$npm_config_registry` or the public one; `.npmrc` files are not read.
   Bundled dependencies are not scanned.
-- Not supported yet: yarn and pnpm lockfiles, Gradle, Go, Flutter/Dart (planned, see
+- pnpm: changes need pnpm >= 10 (lockfiles from pnpm 9 are read). The registry is
+  `$pnpm_config_registry`, `$npm_config_registry` or the public one; `.npmrc` and
+  `pnpm-workspace.yaml` settings are not read. Dependencies declared through a pnpm catalog
+  (`catalog:`) are not bumped (`manifest_not_editable`). The lockfile does not record the ranges
+  that registry packages declare, so they are fetched once per package version from the registry
+  (and cached). A project that has both `package-lock.json` and `pnpm-lock.yaml` is detected as
+  npm; set `ecosystem = "pnpm"` to choose pnpm.
+- Not supported yet: yarn lockfiles, Gradle, Go, Flutter/Dart (planned, see
   [PLAN.md](PLAN.md)).
 
 OSV responses and registry metadata are cached under `$MENDR_CACHE_DIR`,

@@ -7,7 +7,7 @@
 //! 4. `./.mendr-cache`
 //!
 //! Namespaces in use: `osv` (advisory records). Adapters should use their own
-//! namespace (`cargo-index`, `crates-io`, `npm`). Cache failures are never
+//! namespace (`cargo-index`, `crates-io`, `npm`, `pnpm`). Cache failures are never
 //! fatal: reads return `None`, writes are best-effort.
 
 use std::path::PathBuf;

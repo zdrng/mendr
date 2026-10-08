@@ -1,0 +1,19 @@
+{
+  "mode": "full",
+  "args": ["--write"],
+  "exit_code": 0,
+  "findings": [
+    {
+      "advisory": "GHSA-xvch-5gv4-984h",
+      "package": "minimist",
+      "version": "1.2.5",
+      "via": "mkdirp",
+      "strategy": "relock",
+      "target": { "package": "minimist", "to": "1.2.6" },
+      "outcome": "fixed"
+    }
+  ],
+  "files": {
+    "pnpm-lock.yaml": ["minimist: 1.2.6"]
+  }
+}

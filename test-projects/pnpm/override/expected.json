@@ -1,0 +1,29 @@
+{
+  "mode": "full",
+  "args": ["--write"],
+  "exit_code": 0,
+  "findings": [
+    {
+      "advisory": "GHSA-9wv6-86v2-598j",
+      "package": "path-to-regexp",
+      "version": "0.1.7",
+      "via": "router",
+      "strategy": "override",
+      "target": { "package": "path-to-regexp", "to": "0.1.13" },
+      "outcome": "fixed"
+    },
+    {
+      "advisory": "GHSA-rhx6-c78j-4q9w",
+      "package": "path-to-regexp",
+      "version": "0.1.7",
+      "via": "router",
+      "strategy": "override",
+      "target": { "package": "path-to-regexp", "to": "0.1.13" },
+      "outcome": "fixed"
+    }
+  ],
+  "files": {
+    "pnpm-workspace.yaml": ["'router@1.3.8>path-to-regexp': '0.1.13'"],
+    "pnpm-lock.yaml": ["path-to-regexp: 0.1.13"]
+  }
+}

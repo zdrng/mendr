@@ -259,6 +259,7 @@ fn run_scenario(dir: &Path) -> Result<(), String> {
         .env("HOME", &home)
         .env("CARGO_HOME", cache.join("cargo"))
         .env("npm_config_cache", cache.join("npm"))
+        .env("pnpm_config_store_dir", cache.join("pnpm-store"))
         .env("MENDR_CACHE_DIR", cache.join("mendr"));
     // Toolchain setup from the dev shell (compiler wrappers, SDK paths, TLS
     // trust roots), not secrets. `NIX_CONFIG` can hold access tokens.

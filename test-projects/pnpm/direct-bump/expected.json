@@ -1,0 +1,20 @@
+{
+  "mode": "full",
+  "args": ["--write"],
+  "exit_code": 0,
+  "findings": [
+    {
+      "advisory": "GHSA-896r-f27r-55mw",
+      "package": "json-schema",
+      "version": "0.2.3",
+      "via": "jsprim",
+      "strategy": "direct_bump",
+      "target": { "package": "jsprim", "to": "1.4.2" },
+      "outcome": "fixed"
+    }
+  ],
+  "files": {
+    "package.json": ["\"jsprim\": \"^1.4.2\""],
+    "pnpm-lock.yaml": ["json-schema: 0.4.0"]
+  }
+}

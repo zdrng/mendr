@@ -1,0 +1,16 @@
+{
+  "mode": "full",
+  "args": ["--allow-major"],
+  "exit_code": 1,
+  "findings": [
+    {
+      "advisory": "GHSA-rp65-9cf3-cjxr",
+      "package": "nth-check",
+      "version": "1.0.2",
+      "via": "nth-check",
+      "strategy": "direct_bump",
+      "target": { "package": "nth-check", "to": "2.0.1" },
+      "outcome": "failed:test_failed"
+    }
+  ]
+}

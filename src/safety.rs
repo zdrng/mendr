@@ -103,6 +103,16 @@ const CREDENTIAL_FILES: &[(&str, Cred, &str)] = &[
         "npm registry token",
     ),
     (".yarnrc.yml", Cred::Contains(&["npmAuth"]), "Yarn token"),
+    (
+        ".config/pnpm/rc",
+        Cred::Contains(&["_auth", "_password"]),
+        "pnpm registry token",
+    ),
+    (
+        "Library/Preferences/pnpm/rc",
+        Cred::Contains(&["_auth", "_password"]),
+        "pnpm registry token",
+    ),
     (".config/gh/hosts.yml", Cred::Any, "GitHub CLI credentials"),
     (
         ".docker/config.json",
@@ -482,6 +492,10 @@ mod tests {
         write(&h.join(".aws/credentials"), "[default]\n");
         write(&h.join(".npmrc"), "//registry.npmjs.org/:_authToken=x\n");
         write(
+            &h.join(".config/pnpm/rc"),
+            "//registry.npmjs.org/:_authToken=x\n",
+        );
+        write(
             &h.join(".docker/config.json"),
             r#"{"credsStore": "desktop"}"#,
         );
@@ -505,6 +519,7 @@ mod tests {
             ".ssh/deploy is readable (SSH private key)",
             ".aws/credentials is readable (AWS credentials)",
             ".npmrc is readable (npm registry token)",
+            ".config/pnpm/rc is readable (pnpm registry token)",
             ".docker/config.json is readable (Docker registry credentials)",
             ".config/gh/hosts.yml is readable (GitHub CLI credentials)",
             "cargo-home/credentials.toml is readable (Cargo registry token)",
