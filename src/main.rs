@@ -8,13 +8,15 @@ mod http;
 mod model;
 mod osv;
 mod plan;
+mod progress;
 mod report;
 mod rules;
 mod safety;
 mod verify;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
@@ -70,6 +72,10 @@ struct Cli {
     /// Copy verified manifest/lockfile changes back into the project.
     #[arg(long, conflicts_with = "plan_only")]
     write: bool,
+
+    /// Print only warnings and errors on stderr (no progress).
+    #[arg(long, short)]
+    quiet: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -83,13 +89,15 @@ fn main() -> ExitCode {
     match run(&cli) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
-            eprintln!("error: {e:#}");
+            progress::error(format!("{e:#}"));
             ExitCode::from(2)
         }
     }
 }
 
 fn run(cli: &Cli) -> Result<u8> {
+    progress::init(cli.quiet);
+    let started = Instant::now();
     let cwd = std::env::current_dir().context("reading current directory")?;
     let mut config = Config::load(cli.config.as_deref(), &cwd)?;
     config.apply_overrides(&Overrides {
@@ -114,12 +122,12 @@ fn run(cli: &Cli) -> Result<u8> {
         .iter()
         .filter(|r| rules::ignore_expired(r, today))
     {
-        eprintln!(
-            "warning: [[ignore]] entry for {} expired on {}; the advisory is reported again \
+        progress::warn(format!(
+            "[[ignore]] entry for {} expired on {}; the advisory is reported again \
              (renew or remove the entry)",
             rule.id,
             rule.expires.expect("expired rules have a date")
-        );
+        ));
     }
     let mode = if cli.plan_only {
         Mode::Plan
@@ -131,13 +139,18 @@ fn run(cli: &Cli) -> Result<u8> {
     for project in &config.projects {
         let mut pr = ProjectReport::new(&project.path, &config.base_dir);
         if let Err(e) = run_project(cli, &config, project, &mut osv, now, &mut pr) {
-            eprintln!("error: project {}: {e:#}", pr.path);
+            progress::error(format!("project {}: {e:#}", pr.path));
             pr.error = Some(format!("{e:#}"));
         }
         projects.push(pr);
     }
 
     let report = Report::new(mode, projects);
+    let took = progress::elapsed(started);
+    match summarize(&report) {
+        Some(summary) => progress::line("Finished", format!("{summary} ({took})")),
+        None => progress::line("Finished", format!("in {took}")),
+    }
     let text = match cli.format {
         Format::Json => report.to_json(),
         Format::Markdown => report.to_markdown(),
@@ -176,14 +189,44 @@ fn run_project(
     }
     let eco = ecosystem_for(project)?;
     report.ecosystem = Some(eco.name().to_string());
-    eprintln!("mendr: {} ({})", project.path.display(), eco.name());
+    progress::line(
+        "Scanning",
+        format!("{} ({})", display_path(&project.path), eco.name()),
+    );
 
+    let step = progress::begin("Resolving", "dependency graph");
     let graph = eco
         .resolve_graph(&project.path)
         .context("resolving dependency graph")?;
+    let packages = osv::package_names(&graph);
+    step.done(
+        "Resolved",
+        progress::count(
+            graph.nodes.len().saturating_sub(graph.roots.len()),
+            "dependency",
+            "dependencies",
+        ),
+    );
+
+    let step = progress::begin(
+        "Checking",
+        format!(
+            "{} against OSV",
+            progress::count(packages.len(), "package", "packages")
+        ),
+    );
     let advisories = osv
-        .advisories(eco.as_ref(), &osv::package_names(&graph))
+        .advisories(eco.as_ref(), &packages)
         .context("looking up advisories")?;
+    step.done(
+        "Checked",
+        format!(
+            "{} against OSV",
+            progress::count(packages.len(), "package", "packages")
+        ),
+    );
+
+    let step = progress::begin("Planning", "fixes");
     let mut project_plan = plan::plan(&plan::PlanInput {
         eco: eco.as_ref(),
         graph: &graph,
@@ -192,6 +235,19 @@ fn run_project(
         ignores: &config.ignores,
         now,
     });
+    if project_plan.findings.is_empty() {
+        drop(step);
+        progress::line("Found", "no known vulnerabilities");
+    } else {
+        step.done(
+            "Planned",
+            format!(
+                "{} for {}",
+                progress::count(project_plan.changes.len(), "change", "changes"),
+                progress::count(project_plan.findings.len(), "finding", "findings")
+            ),
+        );
+    }
 
     if !cli.plan_only && !project_plan.changes.is_empty() {
         let ctx = verify::VerifyContext {
@@ -206,7 +262,7 @@ fn run_project(
         let verified = verify::verify(&ctx, osv, &mut project_plan)?;
         if cli.write {
             for file in verify::write_back(&ctx, &verified)? {
-                eprintln!("mendr: updated {}", file.display());
+                progress::line("Updated", display_path(&file));
             }
         }
     }
@@ -214,4 +270,42 @@ fn run_project(
     report.findings = project_plan.findings;
     report.changes = project_plan.changes;
     Ok(())
+}
+
+/// `path` relative to the current directory when it is inside it.
+fn display_path(path: &Path) -> String {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    match path.strip_prefix(&cwd) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Ok(rel) => rel.display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// `3 findings: 2 fixed, 1 skipped` for the final progress line; `None`
+/// when there is nothing to say (already reported per project).
+fn summarize(report: &Report) -> Option<String> {
+    let s = &report.summary;
+    let mut parts: Vec<String> = [
+        (s.fixed, "fixed"),
+        (s.planned, "planned"),
+        (s.skipped, "skipped"),
+        (s.failed, "failed"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    if s.errors > 0 {
+        parts.push(progress::count(s.errors, "project error", "project errors"));
+    }
+    match (s.findings, parts.is_empty()) {
+        (0, true) => None,
+        (0, false) => Some(parts.join(", ")),
+        (n, _) => Some(format!(
+            "{}: {}",
+            progress::count(n, "finding", "findings"),
+            parts.join(", ")
+        )),
+    }
 }

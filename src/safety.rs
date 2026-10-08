@@ -188,10 +188,10 @@ fn decide(config: &SafetyConfig, violations: &[Violation]) -> Result<()> {
         .map(|v| format!("  - [{}] {}", v.check, v.detail))
         .collect();
     if config.allow_unsandboxed {
-        eprintln!(
-            "warning: running builds with secrets reachable (--allow-unsandboxed):\n{}",
+        crate::progress::warn(format!(
+            "running builds with secrets reachable (--allow-unsandboxed):\n{}",
             list.join("\n")
-        );
+        ));
         return Ok(());
     }
     bail!(

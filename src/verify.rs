@@ -53,6 +53,7 @@ use crate::ecosystem::{ApplyOptions, Commands, Ecosystem};
 use crate::model::{Change, DepGraph, FailReason, NodeId, Outcome, Step, log_tail};
 use crate::osv::{self, Advisory, Osv};
 use crate::plan::{Finding, ProjectPlan};
+use crate::progress;
 use crate::rules::{self, IgnoreMatch};
 
 /// Everything `verify` needs for one project.
@@ -97,14 +98,15 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
     copy_tree(&root, &work, excludes, true)
         .with_context(|| format!("copying {} to {}", root.display(), work.display()))?;
 
-    eprintln!("mendr: baseline in {}", work.display());
+    let step = progress::begin("Baseline", "install, build and test in a temporary copy");
     if let Err(reason) = run_steps(ctx, &work, true) {
-        eprintln!("mendr: baseline failed ({})", describe_reason(&reason));
+        step.failed("Baseline", describe_reason(&reason));
         set_outcomes(plan, &[], &HashMap::new(), Some(&reason));
         return Ok(Verified::default());
     }
     let mut current = scan(ctx, osv, &work)
         .map_err(|r| anyhow::anyhow!("scanning the baseline: {}", describe_reason(&r)))?;
+    step.done("Baseline", "passed");
 
     let mut kept = Vec::new();
     let mut failed: HashMap<Change, FailReason> = HashMap::new();
@@ -112,7 +114,7 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
     // A reverted attempt ran commands after the last kept change.
     let mut dirty = false;
     for change in &plan.changes {
-        eprintln!("mendr: trying {change}");
+        let step = progress::begin("Trying", change);
         let findings: Vec<&Finding> = plan
             .findings
             .iter()
@@ -127,11 +129,11 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
             // vulnerable node, or a bump that also moved it): nothing to apply.
             match check_still_vulnerable(ctx.eco, &findings, &current) {
                 Ok(()) => {
-                    eprintln!("mendr:   already done by an earlier change");
+                    step.done("Kept", format!("{change} (done by an earlier change)"));
                     kept.push(change.clone());
                 }
                 Err(reason) => {
-                    eprintln!("mendr:   failed: {}", describe_reason(&reason));
+                    step.failed("Failed", format!("{change}: {}", describe_reason(&reason)));
                     failed.insert(change.clone(), reason);
                 }
             }
@@ -140,14 +142,17 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
         copy_tree(&work, &snap, excludes, false).context("snapshotting the project copy")?;
         match try_change(ctx, osv, &work, &snap, change, &findings, &current) {
             Ok((after, changed)) => {
-                eprintln!("mendr:   kept");
+                step.done("Kept", change);
                 current = after;
                 files.extend(changed);
                 kept.push(change.clone());
                 dirty = false;
             }
             Err(reason) => {
-                eprintln!("mendr:   reverted: {}", describe_reason(&reason));
+                step.failed(
+                    "Reverted",
+                    format!("{change}: {}", describe_reason(&reason)),
+                );
                 restore(&snap, &work, excludes).context("restoring the project copy")?;
                 failed.insert(change.clone(), reason);
                 dirty = true;
@@ -157,13 +162,19 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
     }
 
     if dirty && !kept.is_empty() {
-        eprintln!("mendr: re-verifying {} kept change(s) together", kept.len());
+        let what = progress::count(kept.len(), "kept change", "kept changes");
+        let step = progress::begin("Verifying", format!("{what} together"));
         if let Err(reason) = run_steps(ctx, &work, false) {
-            eprintln!("mendr:   failed: {}", describe_reason(&reason));
+            step.failed(
+                "Failed",
+                format!("{what} together: {}", describe_reason(&reason)),
+            );
             for change in kept.drain(..) {
                 failed.insert(change, reason.clone());
             }
             files.clear();
+        } else {
+            step.done("Verified", format!("{what} together"));
         }
     }
 
@@ -517,7 +528,7 @@ fn run_shell(dir: &Path, command: &str, timeout: Option<Duration>) -> Run {
     use std::io::{Read, Seek};
     use std::os::unix::process::CommandExt;
 
-    eprintln!("mendr:   $ {command}");
+    progress::detail(&format!("$ {command}"));
     let failed = |e: io::Error| Run::Failed {
         exit_code: None,
         log_tail: format!("could not run `sh -c {command}`: {e}"),
@@ -635,11 +646,11 @@ fn copy_dir(
                     };
                     std::os::unix::fs::symlink(link, &d)?;
                 }
-                _ => eprintln!(
-                    "warning: not copying symlink {} -> {} (it does not resolve inside the project)",
+                _ => progress::warn(format!(
+                    "not copying symlink {} -> {} (it does not resolve inside the project)",
                     s.display(),
                     target.display()
-                ),
+                )),
             }
         }
     }

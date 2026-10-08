@@ -49,6 +49,7 @@ fn map_err(url: &str, e: ureq::Error) -> HttpError {
 
 /// GET `url` and return the body as a string. Extra headers are optional.
 pub fn get_string(url: &str, headers: &[(&str, &str)]) -> Result<String, HttpError> {
+    show(url);
     let mut req = agent().get(url);
     for (k, v) in headers {
         req = req.header(*k, *v);
@@ -63,6 +64,7 @@ pub fn get_string(url: &str, headers: &[(&str, &str)]) -> Result<String, HttpErr
 
 /// POST a JSON body to `url` and return the response body as a string.
 pub fn post_json(url: &str, body: &serde_json::Value) -> Result<String, HttpError> {
+    show(url);
     let mut resp = agent()
         .post(url)
         .send_json(body)
@@ -72,4 +74,9 @@ pub fn post_json(url: &str, body: &serde_json::Value) -> Result<String, HttpErro
         .limit(BODY_LIMIT)
         .read_to_string()
         .map_err(|e| map_err(url, e))
+}
+
+/// Show the request on the progress status line (`registry.npmjs.org/foo`).
+fn show(url: &str) {
+    crate::progress::detail(url.strip_prefix("https://").unwrap_or(url));
 }

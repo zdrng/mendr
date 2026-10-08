@@ -54,7 +54,21 @@ mendr --write                           # ... and apply the verified changes to 
 mendr --format markdown --output report.md
 ```
 
-Progress goes to stderr, the report to stdout (or `--output`).
+Progress goes to stderr, the report to stdout (or `--output`). Each finished
+step prints one line; on a terminal the step in progress also shows a spinner,
+the elapsed time and the current request or command:
+
+```text
+    Scanning . (npm)
+    Resolved 9 dependencies (0.0s)
+     Checked 9 packages against OSV (2.4s)
+     Planned 1 change for 2 findings (0.5s)
+    Baseline passed (0.7s)
+        Kept override path-to-regexp 0.1.7 → 0.1.13 (0.9s)
+    Finished 2 findings: 2 fixed (4.4s)
+```
+
+`--quiet` keeps only warnings and errors; `NO_COLOR` turns off colors.
 
 ### Flags
 
@@ -68,6 +82,7 @@ Progress goes to stderr, the report to stdout (or `--output`).
 | `--allow-major` | allow major version bumps (`[policy] allow-major`) |
 | `--allow-unsandboxed` | run builds even when the safety checks fail (`[safety] allow-unsandboxed`) |
 | `--min-release-age <DUR>` | minimum age of any version mendr picks: `"7d"`, `"12h"`, `"20m"`, `"30s"`, `"0"` = off (`[policy] min-release-age`, default `7d`) |
+| `-q`, `--quiet` | print only warnings and errors on stderr |
 | `--write` | copy verified manifest/lockfile changes back into the project (not with `--plan-only`) |
 
 ## Configuration: `mendr.toml`

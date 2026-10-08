@@ -792,7 +792,7 @@ impl Ecosystem for Cargo {
         if entries.iter().any(|e| e.pubtime.is_none()) {
             match crates_io_dates(package) {
                 Ok(d) => dates = d,
-                Err(e) => eprintln!("warning: no publish dates for {package}: {e}"),
+                Err(e) => crate::progress::warn(format!("no publish dates for {package}: {e}")),
             }
         }
         Ok(entries

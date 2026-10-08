@@ -236,6 +236,7 @@ pub trait Ecosystem {
 /// cannot be started) returns [`AdapterError::Command`] with the stderr tail.
 pub fn run(cmd: &mut Command) -> Result<String, AdapterError> {
     let command = describe(cmd);
+    crate::progress::detail(&format!("$ {command}"));
     let output = cmd.output().map_err(|e| AdapterError::Command {
         command: command.clone(),
         exit_code: None,

@@ -363,10 +363,14 @@ impl Change {
 
 impl fmt::Display for Change {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let verb = match self {
+            Change::Relock { .. } => "relock",
+            Change::DirectBump { .. } => "bump",
+            Change::Override { .. } => "override",
+        };
         write!(
             f,
-            "{} {} {} -> {}",
-            self.strategy(),
+            "{verb} {} {} → {}",
             self.package(),
             self.from(),
             self.to()
