@@ -107,7 +107,8 @@ pub struct Finding {
 /// Planner output for one project.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProjectPlan {
-    /// Sorted by (package, version, advisory id, via).
+    /// Sorted by (package, version, advisory id, via); versions in the
+    /// ecosystem's order.
     pub findings: Vec<Finding>,
     /// Distinct merged changes, in order of first use.
     pub changes: Vec<Change>,
@@ -130,20 +131,12 @@ pub fn plan(input: &PlanInput) -> ProjectPlan {
     let mut planner = Planner::new(input);
     let mut findings = planner.findings();
     findings.sort_by(|(a, _), (b, _)| {
-        (
-            &a.package,
-            a.version.as_str(),
-            &a.advisory.id,
-            &a.via.name,
-            a.via.version.as_str(),
-        )
-            .cmp(&(
-                &b.package,
-                b.version.as_str(),
-                &b.advisory.id,
-                &b.via.name,
-                b.via.version.as_str(),
-            ))
+        a.package
+            .cmp(&b.package)
+            .then_with(|| eco.compare(&a.version, &b.version))
+            .then_with(|| a.advisory.id.cmp(&b.advisory.id))
+            .then_with(|| a.via.name.cmp(&b.via.name))
+            .then_with(|| eco.compare(&a.via.version, &b.via.version))
     });
     let (mut findings, goals): (Vec<Finding>, Vec<Option<Goal>>) = findings.into_iter().unzip();
     let changes = merge(eco, input.policy, &mut findings, &mut |i, change| {
@@ -1900,6 +1893,34 @@ mod tests {
         });
         assert_eq!(changes, vec![relock("1.0.2"), relock("1.0.1")]);
         assert_eq!(apart[1].change, Some(relock("1.0.1")));
+    }
+
+    #[test]
+    fn two_vulnerable_versions_sort_in_version_order() {
+        // p@1.9.0 via a and p@1.10.0 via b; both pinned.
+        let mut f = Fake::new();
+        let root = f.root("app", "0.1.0");
+        let b = f.dep(root, "b", "1.0.0", "^1");
+        f.dep(b, "p", "1.10.0", "=1.10.0");
+        let a = f.dep(root, "a", "1.0.0", "^1");
+        f.dep(a, "p", "1.9.0", "=1.9.0");
+        for (name, pin) in [("a", "=1.9.0"), ("b", "=1.10.0")] {
+            f.publish(name, "1.0.0", &[("p", pin)]);
+            f.publish(name, "1.1.0", &[("p", "^1.11")]);
+        }
+        for version in ["1.9.0", "1.10.0", "1.11.0"] {
+            f.publish("p", version, &[]);
+        }
+        let plan = run(&f, &[adv("A-1", "p", "0", "1.11.0")], &policy());
+        let seen: Vec<(&str, &str)> = plan
+            .findings
+            .iter()
+            .map(|f| (f.version.as_str(), f.via.name.as_str()))
+            .collect();
+        assert_eq!(seen, vec![("1.9.0", "a"), ("1.10.0", "b")]);
+        let bumped: Vec<&str> = plan.changes.iter().map(Change::package).collect();
+        assert_eq!(bumped, vec!["a", "b"]);
+        assert!(plan.findings.iter().all(|f| f.outcome.label() == "planned"));
     }
 
     #[test]
