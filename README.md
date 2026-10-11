@@ -103,11 +103,11 @@ target = "minimal"           # or "latest-compatible": highest fixed version wit
 
 [safety]
 allow-unsandboxed = false
-deny-paths = ["~/.aws", "/etc/secrets"]   # extra paths that must not be readable
+deny-paths = ["~/.aws", "/etc/secrets"]   # extra paths that must not be readable (`~/` = HOME)
 
 [[project]]                  # repeatable; default: one project at "."
 path = "services/api"        # ecosystem auto-detected
-timeout = "20m"              # per command; default: none
+timeout = "20m"              # per command; default and "0": no timeout
 
 [[project]]
 path = "apps/web"
