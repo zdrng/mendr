@@ -197,7 +197,9 @@ Limitations:
 OSV responses and registry metadata are cached under `$MENDR_CACHE_DIR`,
 `$XDG_CACHE_HOME/mendr` or `~/.cache/mendr` (empty variables are ignored; without `HOME`, a
 `mendr-<uid>` directory in the system temp directory). Entries unused for 30 days are deleted at
-startup.
+startup. Failed requests (connection errors, timeouts, HTTP 408, 429 and 5xx) are retried three
+times with backoff. `MENDR_OSV_API` replaces the OSV API base URL (default
+`https://api.osv.dev/v1`), e.g. with a mirror.
 
 ## Development
 

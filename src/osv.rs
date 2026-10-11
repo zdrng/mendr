@@ -13,8 +13,10 @@
 //!   with `Ecosystem::compare`.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -22,8 +24,11 @@ use serde::{Deserialize, Serialize};
 use crate::ecosystem::Ecosystem;
 use crate::model::{DepGraph, NodeId, Version};
 
+/// Default API base URL; `MENDR_OSV_API` overrides it (mirrors, tests).
 const OSV_API: &str = "https://api.osv.dev/v1";
 const BATCH_SIZE: usize = 500;
+/// Parallel `GET /v1/vulns/{id}` requests.
+const FETCH_WORKERS: usize = 8;
 
 // ---- Schema -------------------------------------------------------------------
 
@@ -538,6 +543,10 @@ pub enum Osv {
     /// osv.dev API. Records are cached on disk under `cache::cache_dir()/osv`
     /// and refetched when the API reports a newer `modified` timestamp.
     Live {
+        /// API base URL without trailing slash.
+        api: String,
+        /// Cache root (`cache::cache_dir()`).
+        cache: PathBuf,
         records: HashMap<String, OsvRecord>,
         /// `(osv ecosystem, package)` -> advisory ids.
         queried: HashMap<(String, String), Vec<String>>,
@@ -558,7 +567,7 @@ struct BatchResult {
     next_page_token: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct BatchVuln {
     id: String,
     #[serde(default)]
@@ -570,8 +579,23 @@ impl Osv {
         Ok(Osv::Snapshot(load_snapshot(dir)?))
     }
 
+    /// The osv.dev API, or `$MENDR_OSV_API` when set and not empty.
     pub fn live() -> Osv {
+        let api = std::env::var("MENDR_OSV_API")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        Osv::live_at(
+            api.as_deref().unwrap_or(OSV_API),
+            &crate::cache::cache_dir(),
+        )
+    }
+
+    /// An OSV API at `api` (e.g. `https://api.osv.dev/v1`), caching records
+    /// under `cache`.
+    pub fn live_at(api: &str, cache: &Path) -> Osv {
         Osv::Live {
+            api: api.trim().trim_end_matches('/').to_string(),
+            cache: cache.to_path_buf(),
             records: HashMap::new(),
             queried: HashMap::new(),
         }
@@ -591,21 +615,28 @@ impl Osv {
                 .filter(|r| packages.iter().any(|p| mentions(r, eco, p)))
                 .cloned()
                 .collect(),
-            Osv::Live { records, queried } => {
+            Osv::Live {
+                api,
+                cache,
+                records,
+                queried,
+            } => {
                 let osv_eco = eco.osv_ecosystem().to_string();
                 let missing: Vec<String> = packages
                     .iter()
                     .filter(|p| !queried.contains_key(&(osv_eco.clone(), (*p).clone())))
                     .cloned()
                     .collect();
-                let found = query_batch(&osv_eco, &missing)?;
+                let found = query_batch(api, &osv_eco, &missing)?;
+                let wanted: BTreeMap<&str, Option<&str>> = found
+                    .iter()
+                    .flat_map(|(_, vulns)| vulns)
+                    .filter(|v| !records.contains_key(&v.id))
+                    .map(|v| (v.id.as_str(), v.modified.as_deref()))
+                    .collect();
+                let wanted: Vec<(&str, Option<&str>)> = wanted.into_iter().collect();
+                records.extend(fetch_records(api, cache, &wanted)?);
                 for (name, vulns) in found {
-                    for v in &vulns {
-                        if !records.contains_key(&v.id) {
-                            records
-                                .insert(v.id.clone(), fetch_record(&v.id, v.modified.as_deref())?);
-                        }
-                    }
                     queried.insert(
                         (osv_eco.clone(), name),
                         vulns.into_iter().map(|v| v.id).collect(),
@@ -628,7 +659,11 @@ impl Osv {
 
 /// `POST /v1/querybatch` with package-only queries (= all advisories for the
 /// package), following `next_page_token`s.
-fn query_batch(osv_eco: &str, packages: &[String]) -> Result<Vec<(String, Vec<BatchVuln>)>> {
+fn query_batch(
+    api: &str,
+    osv_eco: &str,
+    packages: &[String],
+) -> Result<Vec<(String, Vec<BatchVuln>)>> {
     let mut out: Vec<(String, Vec<BatchVuln>)> =
         packages.iter().map(|p| (p.clone(), Vec::new())).collect();
     // (index into `out`, page token)
@@ -648,9 +683,18 @@ fn query_batch(osv_eco: &str, packages: &[String]) -> Result<Vec<(String, Vec<Ba
                 })
                 .collect();
             let body = serde_json::json!({ "queries": queries });
-            let text = crate::http::post_json(&format!("{OSV_API}/querybatch"), &body)?;
+            let text = crate::http::post_json(&format!("{api}/querybatch"), &body)?;
             let resp: BatchResponse =
                 serde_json::from_str(&text).context("parsing OSV querybatch response")?;
+            // Results match queries by position: a short answer would
+            // silently drop packages (= missed vulnerabilities).
+            if resp.results.len() != chunk.len() {
+                anyhow::bail!(
+                    "OSV querybatch returned {} results for {} queries",
+                    resp.results.len(),
+                    chunk.len()
+                );
+            }
             for ((i, _), result) in chunk.iter().zip(resp.results) {
                 out[*i].1.extend(result.vulns);
                 if let Some(t) = result.next_page_token.filter(|t| !t.is_empty()) {
@@ -663,19 +707,61 @@ fn query_batch(osv_eco: &str, packages: &[String]) -> Result<Vec<(String, Vec<Ba
     Ok(out)
 }
 
+/// [`fetch_record`] for every `(id, modified)` with up to [`FETCH_WORKERS`]
+/// threads. Results are in input order; on failure, the error of the first
+/// failed id (in input order) is returned.
+fn fetch_records(
+    api: &str,
+    cache: &Path,
+    wanted: &[(&str, Option<&str>)],
+) -> Result<Vec<(String, OsvRecord)>> {
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let results: Mutex<Vec<Option<Result<OsvRecord>>>> =
+        Mutex::new(wanted.iter().map(|_| None).collect());
+    std::thread::scope(|s| {
+        for _ in 0..FETCH_WORKERS.min(wanted.len()) {
+            s.spawn(|| {
+                while !failed.load(atomic::Ordering::Relaxed) {
+                    let i = next.fetch_add(1, atomic::Ordering::Relaxed);
+                    let Some((id, modified)) = wanted.get(i) else {
+                        break;
+                    };
+                    let result = fetch_record(api, cache, id, *modified);
+                    if result.is_err() {
+                        failed.store(true, atomic::Ordering::Relaxed);
+                    }
+                    results.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(result);
+                }
+            });
+        }
+    });
+    let results = results.into_inner().unwrap_or_else(|e| e.into_inner());
+    // Ids are claimed in order and claimed ids always finish, so every id
+    // before the first failure has a result.
+    let mut out = Vec::with_capacity(wanted.len());
+    for ((id, _), result) in wanted.iter().zip(results) {
+        match result {
+            Some(record) => out.push((id.to_string(), record?)),
+            None => anyhow::bail!("OSV record {id} was not fetched"),
+        }
+    }
+    Ok(out)
+}
+
 /// `GET /v1/vulns/{id}`, using the disk cache when its `modified` matches.
-fn fetch_record(id: &str, modified: Option<&str>) -> Result<OsvRecord> {
-    if let Some(text) = crate::cache::read("osv", id, None)
+fn fetch_record(api: &str, cache: &Path, id: &str, modified: Option<&str>) -> Result<OsvRecord> {
+    if let Some(text) = crate::cache::read_in(cache, "osv", id, None)
         && let Ok(record) = serde_json::from_str::<OsvRecord>(&text)
         && modified.is_some()
         && record.modified.as_deref() == modified
     {
         return Ok(record);
     }
-    let text = crate::http::get_string(&format!("{OSV_API}/vulns/{id}"), &[])?;
+    let text = crate::http::get_string(&format!("{api}/vulns/{id}"), &[])?;
     let record: OsvRecord =
         serde_json::from_str(&text).with_context(|| format!("parsing OSV record {id}"))?;
-    crate::cache::write("osv", id, &text);
+    crate::cache::write_in(cache, "osv", id, &text);
     Ok(record)
 }
 
@@ -902,6 +988,173 @@ mod tests {
             .expect("smallvec advisory");
         assert!(a.affects(&eco, "smallvec", &v("1.6.0")));
         assert!(!a.affects(&eco, "smallvec", &v("1.6.1")));
+    }
+
+    /// A stub OSV API: `querybatch` answers from `vulns` (package -> pages
+    /// of ids; page `n > 0` is requested with token `p<n>`), `vulns/{id}`
+    /// returns a record with `modified` `m1` (status 400 for `BAD-*`).
+    /// Every request is logged as `"<path> <body>"`.
+    fn stub_osv(
+        vulns: &'static [(&'static str, &'static [&'static [&'static str]])],
+    ) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen = log.clone();
+        let base = crate::http::stub::serve(move |req| {
+            seen.lock()
+                .unwrap()
+                .push(format!("{} {}", req.path, req.body));
+            if req.path == "/querybatch" {
+                let body: serde_json::Value = serde_json::from_str(&req.body).unwrap();
+                let results: Vec<serde_json::Value> = body["queries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|q| {
+                        let name = q["package"]["name"].as_str().unwrap();
+                        let page: usize = q["page_token"]
+                            .as_str()
+                            .map_or(0, |t| t[1..].parse().unwrap());
+                        let pages = vulns.iter().find(|(n, _)| *n == name).map_or(&[][..], |v| v.1);
+                        let ids = pages.get(page).copied().unwrap_or_default();
+                        let mut r = serde_json::json!({
+                            "vulns": ids.iter().map(|id| serde_json::json!({"id": id, "modified": "m1"})).collect::<Vec<_>>()
+                        });
+                        if page + 1 < pages.len() {
+                            r["next_page_token"] = format!("p{}", page + 1).into();
+                        }
+                        r
+                    })
+                    .collect();
+                return (
+                    200,
+                    vec![],
+                    serde_json::json!({ "results": results }).to_string(),
+                );
+            }
+            let id = req.path.trim_start_matches("/vulns/");
+            if id.starts_with("BAD-") {
+                return (400, vec![], "no such thing".into());
+            }
+            let pkg = vulns
+                .iter()
+                .find(|(_, pages)| pages.iter().any(|p| p.contains(&id)))
+                .map_or("?", |v| v.0);
+            let record = serde_json::json!({
+                "id": id,
+                "modified": "m1",
+                "affected": [{"package": {"ecosystem": "Fake", "name": pkg}, "versions": ["1.0.0"]}]
+            });
+            (200, vec![], record.to_string())
+        });
+        (base, log)
+    }
+
+    #[test]
+    fn query_batch_follows_page_tokens() {
+        let (api, log) = stub_osv(&[("a", &[&["A-1", "A-2"], &["A-3"]]), ("b", &[])]);
+        let out = query_batch(&api, "Fake", &["a".into(), "b".into(), "c".into()]).unwrap();
+        let ids: Vec<(&str, Vec<&str>)> = out
+            .iter()
+            .map(|(p, v)| (p.as_str(), v.iter().map(|v| v.id.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("a", vec!["A-1", "A-2", "A-3"]),
+                ("b", vec![]),
+                ("c", vec![])
+            ]
+        );
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 2, "{log:?}");
+        let second: serde_json::Value =
+            serde_json::from_str(log[1].split_once(' ').unwrap().1).unwrap();
+        assert_eq!(
+            second["queries"],
+            serde_json::json!([{"package": {"name": "a", "ecosystem": "Fake"}, "page_token": "p1"}])
+        );
+    }
+
+    #[test]
+    fn query_batch_rejects_short_responses() {
+        let api =
+            crate::http::stub::serve(|_| (200, vec![], r#"{"results": [{"vulns": []}]}"#.into()));
+        let err = query_batch(&api, "Fake", &["a".into(), "b".into()]).unwrap_err();
+        assert!(
+            err.to_string().contains("1 results for 2 queries"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn fetch_record_uses_cache_only_when_fresh() {
+        let (api, log) = stub_osv(&[("p", &[&["X-1"]])]);
+        let cache = tempfile::tempdir().unwrap();
+        let cached = serde_json::json!({"id": "X-1", "modified": "m0", "summary": "cached"});
+        crate::cache::write_in(cache.path(), "osv", "X-1", &cached.to_string());
+
+        let r = fetch_record(&api, cache.path(), "X-1", Some("m0")).unwrap();
+        assert_eq!(r.summary.as_deref(), Some("cached"));
+        assert!(log.lock().unwrap().is_empty(), "served from cache");
+
+        let r = fetch_record(&api, cache.path(), "X-1", Some("m1")).unwrap();
+        assert_eq!(r.modified.as_deref(), Some("m1"));
+        assert_eq!(log.lock().unwrap().len(), 1, "newer upstream: refetched");
+        let r = fetch_record(&api, cache.path(), "X-1", Some("m1")).unwrap();
+        assert_eq!(r.modified.as_deref(), Some("m1"));
+        assert_eq!(log.lock().unwrap().len(), 1, "cache updated");
+
+        fetch_record(&api, cache.path(), "X-1", None).unwrap();
+        assert_eq!(log.lock().unwrap().len(), 2, "unknown modified: refetched");
+
+        crate::cache::write_in(cache.path(), "osv", "X-1", "{ corrupt");
+        let r = fetch_record(&api, cache.path(), "X-1", Some("m1")).unwrap();
+        assert_eq!(r.id, "X-1");
+        assert_eq!(log.lock().unwrap().len(), 3, "corrupt cache: refetched");
+    }
+
+    #[test]
+    fn live_advisories_fetch_records_in_parallel() {
+        // More ids than workers; the stub answers in any order.
+        const IDS: &[&str] = &[
+            "A-12", "A-01", "A-02", "A-03", "A-04", "A-05", "A-06", "A-07", "A-08", "A-09", "A-10",
+            "A-11",
+        ];
+        let ids = IDS;
+        let (api, log) = stub_osv(&[("p", &[IDS]), ("q", &[&["Q-1"]])]);
+        let cache = tempfile::tempdir().unwrap();
+        let mut osv = Osv::live_at(&format!("{api}/"), cache.path());
+        let eco = Fake::new();
+        let adv = osv
+            .advisories(&eco, &["p".to_string(), "q".to_string()])
+            .unwrap();
+        let got: Vec<&str> = adv.iter().map(|a| a.id.as_str()).collect();
+        let mut expected = ids.to_vec();
+        expected.sort();
+        expected.push("Q-1");
+        assert_eq!(got, expected);
+        assert!(adv.iter().all(|a| a.affects(
+            &eco,
+            if a.id == "Q-1" { "q" } else { "p" },
+            &v("1.0.0")
+        )));
+        assert_eq!(log.lock().unwrap().len(), 1 + ids.len() + 1);
+
+        // Already queried: no more requests.
+        let again = osv.advisories(&eco, &["q".to_string()]).unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(log.lock().unwrap().len(), 1 + ids.len() + 1);
+    }
+
+    #[test]
+    fn live_advisories_report_fetch_errors() {
+        let (api, _) = stub_osv(&[("p", &[&["A-1", "BAD-1", "BAD-2", "C-1"]])]);
+        let cache = tempfile::tempdir().unwrap();
+        let mut osv = Osv::live_at(&api, cache.path());
+        let err = osv
+            .advisories(&Fake::new(), &["p".to_string()])
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("/vulns/BAD-1"), "{err:#}");
     }
 
     #[test]
