@@ -33,9 +33,11 @@
 //!    `no_parent_version_fixes` (direct bump was tried), else
 //!    `strategy_unsupported`, else `no_parent_version_fixes`.
 //! 6. Merges changes: same `(package, from)` relocks/bumps collapse into one
-//!    change with the highest `to` (a bump wins over a relock); same for
-//!    overrides. Findings point at the merged change. A merged bump/override
-//!    that became major without `allow-major` -> `skipped:major_bump_blocked`.
+//!    change (a bump wins over a relock) with the highest `to` if it still
+//!    fixes every merged finding, else the lower one; a change that fits
+//!    neither stays separate. Same for overrides. Findings point at the
+//!    merged change. A merged bump/override that became major without
+//!    `allow-major` -> `skipped:major_bump_blocked`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
@@ -124,9 +126,10 @@ pub struct PlanInput<'a> {
 /// Plan fixes for one project. Never fails: registry errors become
 /// `failed:error` outcomes on the affected findings.
 pub fn plan(input: &PlanInput) -> ProjectPlan {
+    let eco = input.eco;
     let mut planner = Planner::new(input);
     let mut findings = planner.findings();
-    findings.sort_by(|a, b| {
+    findings.sort_by(|(a, _), (b, _)| {
         (
             &a.package,
             a.version.as_str(),
@@ -142,7 +145,12 @@ pub fn plan(input: &PlanInput) -> ProjectPlan {
                 b.via.version.as_str(),
             ))
     });
-    let changes = merge(input.eco, input.policy, &mut findings);
+    let (mut findings, goals): (Vec<Finding>, Vec<Option<Goal>>) = findings.into_iter().unzip();
+    let changes = merge(eco, input.policy, &mut findings, &mut |i, change| {
+        goals[i]
+            .as_ref()
+            .is_some_and(|goal| planner.fixes(goal, change.package(), change.to()))
+    });
     ProjectPlan { findings, changes }
 }
 
@@ -158,6 +166,18 @@ struct Group {
     /// Names of registry packages between `via` and `P` (exclusive).
     corridor: BTreeSet<String>,
     paths: Vec<Vec<String>>,
+}
+
+/// What a planned change must achieve for its finding; a merged change is
+/// re-checked against it (see [`Planner::fixes`]).
+struct Goal {
+    /// The vulnerable package.
+    target: String,
+    /// The finding's group corridor (for a bump of its via).
+    corridor: BTreeSet<String>,
+    /// Requirements the new version must satisfy (a relock's parent
+    /// requirements; empty otherwise).
+    reqs: Vec<VersionReq>,
 }
 
 /// How one candidate version fares in [`Planner::select`].
@@ -382,7 +402,8 @@ impl<'a> Planner<'a> {
             .collect()
     }
 
-    fn findings(&mut self) -> Vec<Finding> {
+    /// Unsorted findings, each with the [`Goal`] of its change (if any).
+    fn findings(&mut self) -> Vec<(Finding, Option<Goal>)> {
         let input = self.input;
         let mut out = Vec::new();
         for vn in osv::vulnerabilities_for(input.graph, input.eco, input.advisories) {
@@ -442,27 +463,35 @@ impl<'a> Planner<'a> {
                     change,
                     outcome,
                 };
+                let goal = |change: &Change| Goal {
+                    target: node.name.clone(),
+                    corridor: g.corridor.clone(),
+                    reqs: match change {
+                        Change::Relock { .. } => g.parent_reqs.clone(),
+                        _ => Vec::new(),
+                    },
+                };
                 for adv in &active {
                     out.push(match &decisions[gi] {
-                        Ok(change) => finding(
-                            adv,
-                            Some(change.clone()),
-                            Outcome::Planned {
-                                strategy: change.strategy(),
-                                change: change.clone(),
-                            },
+                        Ok(change) => (
+                            finding(
+                                adv,
+                                Some(change.clone()),
+                                Outcome::Planned {
+                                    strategy: change.strategy(),
+                                    change: change.clone(),
+                                },
+                            ),
+                            Some(goal(change)),
                         ),
-                        Err(outcome) => finding(adv, None, outcome.clone()),
+                        Err(outcome) => (finding(adv, None, outcome.clone()), None),
                     });
                 }
                 for (adv, reason) in &skipped {
-                    out.push(finding(
-                        adv,
-                        None,
-                        Outcome::Skipped {
-                            reason: reason.clone(),
-                        },
-                    ));
+                    let outcome = Outcome::Skipped {
+                        reason: reason.clone(),
+                    };
+                    out.push((finding(adv, None, outcome), None));
                 }
             }
         }
@@ -674,6 +703,35 @@ impl<'a> Planner<'a> {
         Err(Outcome::Skipped { reason })
     }
 
+    /// Whether moving `package` to `to` still fixes the finding `goal`
+    /// belongs to: a move of the vulnerable package itself must land on a
+    /// safe version, a bump of its via on a version that is not vulnerable
+    /// itself and whose subtree resolves to a safe target.
+    fn fixes(&mut self, goal: &Goal, package: &str, to: &Version) -> bool {
+        let eco = self.eco();
+        if !goal.reqs.iter().all(|r| eco.satisfies(r, to)) {
+            return false;
+        }
+        let target = Target {
+            name: &goal.target,
+            advisories: self.active_advisories(&goal.target),
+        };
+        if package == goal.target {
+            return target.is_safe(eco, to);
+        }
+        if self
+            .active_advisories(package)
+            .iter()
+            .any(|a| a.affects(eco, package, to))
+        {
+            return false;
+        }
+        let mut walk = self.walk(&target, &goal.corridor);
+        let ok = self.subtree_ok(package, to, &mut walk, 0);
+        self.store(walk);
+        ok.is_ok_and(|(ok, _)| ok)
+    }
+
     /// Start walks for `target` through `corridor`, with the results
     /// settled by earlier walks.
     fn walk<'w>(&mut self, target: &'w Target<'w>, corridor: &'w BTreeSet<String>) -> Walk<'w> {
@@ -779,33 +837,53 @@ impl Target<'_> {
 }
 
 /// Merge planned changes (see module docs) and rewrite findings to point at
-/// the merged change. Returns the distinct changes in order of first use.
-fn merge(eco: &dyn Ecosystem, policy: &Policy, findings: &mut [Finding]) -> Vec<Change> {
-    // key: (is_override, package, from)
-    let mut merged: Vec<((bool, String, Version), Change)> = Vec::new();
-    for f in findings.iter() {
+/// the merged change. `fixes(i, change)` tells whether `change` still fixes
+/// finding `i`. Returns the distinct changes in order of first use.
+fn merge(
+    eco: &dyn Ecosystem,
+    policy: &Policy,
+    findings: &mut [Finding],
+    fixes: &mut dyn FnMut(usize, &Change) -> bool,
+) -> Vec<Change> {
+    // (is_override, package, from) -> first merged change with that key
+    let mut by_key: HashMap<(bool, String, Version), usize> = HashMap::new();
+    // Merged changes with the findings they fix.
+    let mut merged: Vec<(Change, Vec<usize>)> = Vec::new();
+    let mut merged_into: Vec<Option<usize>> = vec![None; findings.len()];
+    for (i, f) in findings.iter().enumerate() {
         let Some(change) = &f.change else { continue };
         let key = (
             matches!(change, Change::Override { .. }),
             change.package().to_string(),
             change.from().clone(),
         );
-        match merged.iter_mut().find(|(k, _)| *k == key) {
-            None => merged.push((key, change.clone())),
-            Some((_, existing)) => *existing = combine(eco, existing, change),
+        if let Some(&m) = by_key.get(&key) {
+            let (existing, members) = &merged[m];
+            let (low, high) = if eco.compare(existing.to(), change.to()).is_ge() {
+                (change.to(), existing.to())
+            } else {
+                (existing.to(), change.to())
+            };
+            // The higher version, else the lower one, if it fixes them all.
+            let fixing = [high, low]
+                .map(|to| combine(eco, existing, change, to.clone()))
+                .into_iter()
+                .find(|c| members.iter().chain([&i]).all(|&j| fixes(j, c)));
+            if let Some(c) = fixing {
+                merged[m].0 = c;
+                merged[m].1.push(i);
+                merged_into[i] = Some(m);
+                continue;
+            }
         }
+        // The first change with this key, or one that cannot be merged.
+        by_key.entry(key).or_insert(merged.len());
+        merged_into[i] = Some(merged.len());
+        merged.push((change.clone(), vec![i]));
     }
-    for f in findings.iter_mut() {
-        let Some(change) = &f.change else { continue };
-        let key = (
-            matches!(change, Change::Override { .. }),
-            change.package().to_string(),
-            change.from().clone(),
-        );
-        let (_, m) = merged
-            .iter()
-            .find(|(k, _)| *k == key)
-            .expect("merged above");
+    for (f, m) in findings.iter_mut().zip(&merged_into) {
+        let Some(m) = m else { continue };
+        let m = &merged[*m].0;
         if major_blocked(eco, policy, m) {
             f.strategy = None;
             f.change = None;
@@ -827,11 +905,13 @@ fn merge(eco: &dyn Ecosystem, policy: &Policy, findings: &mut [Finding]) -> Vec<
             };
         }
     }
-    merged
-        .into_iter()
-        .map(|(_, c)| c)
-        .filter(|c| !major_blocked(eco, policy, c))
-        .collect()
+    let mut changes = Vec::new();
+    for (c, _) in merged {
+        if !major_blocked(eco, policy, &c) && !changes.contains(&c) {
+            changes.push(c);
+        }
+    }
+    changes
 }
 
 /// A merged bump or override can be major although each part was not (a
@@ -842,17 +922,18 @@ fn major_blocked(eco: &dyn Ecosystem, policy: &Policy, c: &Change) -> bool {
         && !rules::bump_allowed(eco.bump_kind(c.from(), c.to()), policy)
 }
 
-fn combine(eco: &dyn Ecosystem, a: &Change, b: &Change) -> Change {
-    let to = if eco.compare(a.to(), b.to()).is_ge() {
-        a.to()
-    } else {
-        b.to()
-    }
-    .clone();
+/// `a` merged with `b` (same package and `from`) as one change to `to`: a
+/// bump wins over a relock; overrides only merge with overrides.
+fn combine(eco: &dyn Ecosystem, a: &Change, b: &Change, to: Version) -> Change {
     let package = a.package().to_string();
     let from = a.from().clone();
     match (a, b) {
-        (Change::Override { .. }, _) => Change::Override { package, from, to },
+        (Change::Override { .. }, Change::Override { .. }) => {
+            Change::Override { package, from, to }
+        }
+        (Change::Override { .. }, _) | (_, Change::Override { .. }) => {
+            unreachable!("overrides are merged only with overrides")
+        }
         (Change::Relock { .. }, Change::Relock { .. }) => Change::Relock { package, from, to },
         _ => Change::DirectBump {
             bump: eco.bump_kind(&from, &to),
@@ -1315,7 +1396,7 @@ mod tests {
             to: v("1.0.0"),
             bump: BumpKind::Patch,
         };
-        let c = combine(&f, &relock, &bump);
+        let c = combine(&f, &relock, &bump, v("1.0.1"));
         assert_eq!(
             c,
             Change::DirectBump {
@@ -1562,7 +1643,7 @@ mod tests {
         };
         let f = Fake::new();
         let mut blocked = findings();
-        assert!(merge(&f, &policy(), &mut blocked).is_empty());
+        assert!(merge(&f, &policy(), &mut blocked, &mut |_, _| true).is_empty());
         for finding in &blocked {
             assert_eq!(
                 skip_reason(finding),
@@ -1578,7 +1659,7 @@ mod tests {
         let mut pol = policy();
         pol.allow_major = true;
         assert_eq!(
-            merge(&f, &pol, &mut findings()),
+            merge(&f, &pol, &mut findings(), &mut |_, _| true),
             vec![Change::DirectBump {
                 package: "p".into(),
                 from: v("1.0.0"),
@@ -1754,6 +1835,71 @@ mod tests {
         f.graph.add_edge(a, p, VersionReq::new("=1.0.0"));
         let plan = run(&f, &advisories, &policy());
         assert_eq!(skip_reason(only(&plan)), &no_parent_fix("a", "p"));
+    }
+
+    #[test]
+    fn merged_change_must_fix_every_finding() {
+        // a@1.0.0 is vulnerable itself and pins p. A relock of a picks the
+        // latest 1.2.0, which pins p again; the bump of a for p picks 1.1.0.
+        let mut f = transitive("=1.0.0");
+        f.publish("a", "1.1.0", &[("p", "^1.0.1")]);
+        f.publish("a", "1.2.0", &[("p", "=1.0.0")]);
+        let mut pol = policy();
+        pol.target = TargetPolicy::LatestCompatible;
+        let advisories = [adv("A-1", "p", "0", "1.0.1"), adv("V-1", "a", "0", "1.0.1")];
+        let plan = run(&f, &advisories, &pol);
+        let merged = Change::DirectBump {
+            package: "a".into(),
+            from: v("1.0.0"),
+            to: v("1.1.0"),
+            bump: BumpKind::Minor,
+        };
+        assert_eq!(plan.changes, vec![merged.clone()]);
+        assert_eq!(plan.findings.len(), 2);
+        for finding in &plan.findings {
+            assert_eq!(finding.change, Some(merged.clone()), "{}", finding.package);
+        }
+    }
+
+    #[test]
+    fn merge_falls_back_to_the_lower_version_or_keeps_changes_apart() {
+        let relock = |to: &str| Change::Relock {
+            package: "p".into(),
+            from: v("1.0.0"),
+            to: v(to),
+        };
+        let finding = |via: &str, change: Change| Finding {
+            advisory: (&adv("A-1", "p", "0", "2.0.0")).into(),
+            package: "p".into(),
+            version: v("1.0.0"),
+            via: PackageRef {
+                name: via.into(),
+                version: v("1.0.0"),
+            },
+            paths: Vec::new(),
+            strategy: Some(change.strategy()),
+            outcome: Outcome::Planned {
+                strategy: change.strategy(),
+                change: change.clone(),
+            },
+            change: Some(change),
+        };
+        let findings = || vec![finding("a", relock("1.0.2")), finding("b", relock("1.0.1"))];
+        let f = Fake::new();
+        // b's parents do not allow 1.0.2: both move to 1.0.1.
+        let mut low = findings();
+        let changes = merge(&f, &policy(), &mut low, &mut |i, c| {
+            i == 0 || c.to() == &v("1.0.1")
+        });
+        assert_eq!(changes, vec![relock("1.0.1")]);
+        assert!(low.iter().all(|f| f.change == Some(relock("1.0.1"))));
+        // Neither version fixes both: each keeps its own change.
+        let mut apart = findings();
+        let changes = merge(&f, &policy(), &mut apart, &mut |i, c| {
+            c.to() == &v(["1.0.2", "1.0.1"][i])
+        });
+        assert_eq!(changes, vec![relock("1.0.2"), relock("1.0.1")]);
+        assert_eq!(apart[1].change, Some(relock("1.0.1")));
     }
 
     #[test]
