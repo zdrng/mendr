@@ -304,6 +304,10 @@ impl Ecosystem for Pnpm {
         &["node_modules"]
     }
 
+    fn manifest_files(&self) -> &'static [&'static str] {
+        &["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"]
+    }
+
     fn releases(&self, package: &str) -> Result<Vec<Release>, AdapterError> {
         Ok(self.info(package)?.releases.clone())
     }

@@ -322,6 +322,10 @@ impl Ecosystem for Fake {
         &["target"]
     }
 
+    fn manifest_files(&self) -> &'static [&'static str] {
+        &[LOCKFILE]
+    }
+
     fn releases(&self, package: &str) -> Result<Vec<Release>, AdapterError> {
         *self.registry_calls.borrow_mut() += 1;
         self.registry

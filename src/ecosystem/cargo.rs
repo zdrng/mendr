@@ -786,6 +786,10 @@ impl Ecosystem for Cargo {
         &["target"]
     }
 
+    fn manifest_files(&self) -> &'static [&'static str] {
+        &["Cargo.toml", "Cargo.lock"]
+    }
+
     fn releases(&self, package: &str) -> Result<Vec<Release>, AdapterError> {
         let entries = self.entries(package)?;
         let mut dates = HashMap::new();
