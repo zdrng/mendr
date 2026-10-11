@@ -195,7 +195,9 @@ Limitations:
   [PLAN.md](PLAN.md)).
 
 OSV responses and registry metadata are cached under `$MENDR_CACHE_DIR`,
-`$XDG_CACHE_HOME/mendr` or `~/.cache/mendr`.
+`$XDG_CACHE_HOME/mendr` or `~/.cache/mendr` (empty variables are ignored; without `HOME`, a
+`mendr-<uid>` directory in the system temp directory). Entries unused for 30 days are deleted at
+startup.
 
 ## Development
 
