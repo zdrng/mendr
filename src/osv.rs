@@ -420,17 +420,14 @@ impl Advisory {
     }
 }
 
-/// Ids and aliases (see [`normalize_id`]) of every advisory returned by
-/// [`Osv::advisories`] in this process, for [`warn_unmatched_ignores`].
-static SEEN_IDS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-
 /// An advisory id as [`Advisory::has_id`] compares it.
 fn normalize_id(id: &str) -> String {
     id.trim().to_ascii_uppercase()
 }
 
-fn remember_ids(advisories: &[Advisory]) {
-    let mut seen = SEEN_IDS.lock().unwrap_or_else(|e| e.into_inner());
+/// Add the ids and aliases of `advisories` to `seen`, for
+/// [`warn_unmatched_ignores`].
+pub fn remember_ids(seen: &mut BTreeSet<String>, advisories: &[Advisory]) {
     for a in advisories {
         seen.extend(
             std::iter::once(&a.id)
@@ -452,12 +449,15 @@ fn unmatched_ignores<'a>(
         .collect()
 }
 
-/// Warn about `[[ignore]]` rules that matched no advisory of the packages
-/// scanned so far (a typo, or no longer needed). Call after all projects.
+/// Warn about `[[ignore]]` rules whose id is not in `seen` (see
+/// [`remember_ids`]): a typo, or no longer needed. Call after all projects.
 /// Expired rules are skipped: they already get their own warning.
-pub fn warn_unmatched_ignores(ignores: &[IgnoreRule], today: jiff::civil::Date) {
-    let seen = SEEN_IDS.lock().unwrap_or_else(|e| e.into_inner());
-    for rule in unmatched_ignores(ignores, &seen, today) {
+pub fn warn_unmatched_ignores(
+    ignores: &[IgnoreRule],
+    seen: &BTreeSet<String>,
+    today: jiff::civil::Date,
+) {
+    for rule in unmatched_ignores(ignores, seen, today) {
         crate::progress::warn(format!(
             "[[ignore]] entry for {} matched no advisory of the scanned packages \
              (check the id, or remove the entry if it is no longer needed)",
@@ -777,7 +777,6 @@ impl Osv {
                 .as_ref()
                 .is_some_and(|p| wanted.contains(p.name.as_str()) && a.is_for(eco, &p.name))
         });
-        remember_ids(&advisories);
         Ok(advisories)
     }
 }
@@ -1141,13 +1140,7 @@ mod tests {
         assert!(!advisories[0].has_id("GHSA-abcd"));
 
         let mut seen = BTreeSet::new();
-        for a in &advisories {
-            seen.extend(
-                std::iter::once(&a.id)
-                    .chain(&a.aliases)
-                    .map(|id| normalize_id(id)),
-            );
-        }
+        remember_ids(&mut seen, &advisories);
         let rule = |id: &str, expires: Option<jiff::civil::Date>| IgnoreRule {
             id: id.into(),
             reason: "r".into(),

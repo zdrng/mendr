@@ -14,6 +14,7 @@ mod rules;
 mod safety;
 mod verify;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -137,15 +138,16 @@ fn run(cli: &Cli) -> Result<u8> {
     };
 
     let mut projects = Vec::new();
+    let mut seen_ids = BTreeSet::new();
     for project in &config.projects {
         let mut pr = ProjectReport::new(&project.path, &config.base_dir);
-        if let Err(e) = run_project(cli, &config, project, &mut osv, now, &mut pr) {
+        if let Err(e) = run_project(cli, &config, project, &mut osv, now, &mut seen_ids, &mut pr) {
             progress::error(format!("project {}: {e:#}", pr.path));
             pr.error = Some(format!("{e:#}"));
         }
         projects.push(pr);
     }
-    osv::warn_unmatched_ignores(&config.ignores, today);
+    osv::warn_unmatched_ignores(&config.ignores, &seen_ids, today);
 
     let report = Report::new(mode, projects);
     let took = progress::elapsed(started);
@@ -184,6 +186,7 @@ fn run_project(
     project: &ProjectConfig,
     osv: &mut Osv,
     now: jiff::Timestamp,
+    seen_ids: &mut BTreeSet<String>,
     report: &mut ProjectReport,
 ) -> Result<()> {
     if !project.path.is_dir() {
@@ -220,6 +223,7 @@ fn run_project(
     let advisories = osv
         .advisories(eco.as_ref(), &packages)
         .context("looking up advisories")?;
+    osv::remember_ids(seen_ids, &advisories);
     step.done(
         "Checked",
         format!(
