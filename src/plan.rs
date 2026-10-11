@@ -462,13 +462,19 @@ impl<'a> Planner<'a> {
                         .collect()
                 };
                 // Paths whose first registry package is `via`: local nodes
-                // that lead to `via`, then anything.
-                let reaching_via = g.reaching(via);
+                // that lead to `via` through local nodes only, then anything.
+                let mut locals_to_via = HashSet::new();
+                let mut stack = vec![via];
+                while let Some(n) = stack.pop() {
+                    for e in g.edges_to(n) {
+                        if is_local(e.from) && locals_to_via.insert(e.from) {
+                            stack.push(e.from);
+                        }
+                    }
+                }
                 let paths = g
-                    .paths_to(p, MAX_PATHS, &|path, next| {
-                        next == via
-                            || path.contains(&via)
-                            || (is_local(next) && reaching_via.contains(&next))
+                    .paths_to(p, &reaching_p, MAX_PATHS, &|path, next| {
+                        next == via || path.contains(&via) || locals_to_via.contains(&next)
                     })
                     .iter()
                     .map(|path| path.iter().map(|&id| g.label(id)).collect())

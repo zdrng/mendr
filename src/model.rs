@@ -11,7 +11,7 @@
 //! Config files (`mendr.toml`) use kebab-case keys; [`Strategy`] additionally
 //! accepts the kebab-case spelling (`"direct-bump"`) when deserializing.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -94,27 +94,80 @@ pub struct Edge {
 /// The resolved dependency graph of one project.
 ///
 /// Invariants adapters must uphold:
-/// - at most one node per `(name, version)` (use [`DepGraph::add_node`],
-///   which dedupes);
+/// - at most one node per `(name, version, registry)` (use
+///   [`DepGraph::add_node`], which dedupes): a workspace member and a registry
+///   package with the same name and version are distinct nodes;
 /// - `roots` are the project's own packages (Cargo workspace members, the npm
 ///   root package) and have `registry == false`;
 /// - every registry node is reachable from some root;
 /// - dev-dependencies of the project's own packages are included (they are
 ///   built and tested), dev-dependencies of registry packages are not.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Add nodes and edges only through the methods below: they keep the lookup
+/// index in sync. Changing `direct` or `version` of an existing node in place
+/// is fine.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(from = "GraphData")]
 pub struct DepGraph {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub roots: Vec<NodeId>,
+    #[serde(skip)]
+    index: Index,
 }
+
+/// Lookup tables derived from [`DepGraph::nodes`] and [`DepGraph::edges`].
+#[derive(Clone, Debug, Default)]
+struct Index {
+    /// Node ids per package name.
+    by_name: HashMap<String, Vec<NodeId>>,
+    /// Per node: indices into `edges` of its outgoing edges.
+    outgoing: Vec<Vec<usize>>,
+    /// Per node: indices into `edges` of its incoming edges.
+    incoming: Vec<Vec<usize>>,
+}
+
+/// The serialized fields of a [`DepGraph`]; the index is rebuilt on load.
+#[derive(Deserialize)]
+struct GraphData {
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
+    roots: Vec<NodeId>,
+}
+
+impl From<GraphData> for DepGraph {
+    fn from(data: GraphData) -> Self {
+        let mut graph = DepGraph {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            roots: data.roots,
+            index: Index::default(),
+        };
+        for node in data.nodes {
+            graph.push_node(node);
+        }
+        for edge in data.edges {
+            graph.push_edge(edge);
+        }
+        graph
+    }
+}
+
+impl PartialEq for DepGraph {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.nodes, &self.edges, &self.roots) == (&other.nodes, &other.edges, &other.roots)
+    }
+}
+
+impl Eq for DepGraph {}
 
 impl DepGraph {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Adds a node, or returns the existing id for the same `(name, version)`.
-    /// If the node exists, `direct` is OR-ed in.
+    /// Adds a node, or returns the existing id for the same
+    /// `(name, version, registry)`. If the node exists, `direct` is OR-ed in.
     pub fn add_node(
         &mut self,
         name: &str,
@@ -122,17 +175,19 @@ impl DepGraph {
         direct: bool,
         registry: bool,
     ) -> NodeId {
-        if let Some(id) = self.find(name, version) {
+        let existing = self
+            .matching(name, version)
+            .find(|&id| self.nodes[id].registry == registry);
+        if let Some(id) = existing {
             self.nodes[id].direct |= direct;
             return id;
         }
-        self.nodes.push(Node {
+        self.push_node(Node {
             name: name.to_string(),
             version: version.clone(),
             direct,
             registry,
-        });
-        self.nodes.len() - 1
+        })
     }
 
     /// Adds a local root package (`registry = false`, `direct = false`).
@@ -146,16 +201,43 @@ impl DepGraph {
 
     /// Adds an edge (duplicates with the same `from`, `to`, `req` are ignored).
     pub fn add_edge(&mut self, from: NodeId, to: NodeId, req: VersionReq) {
-        let edge = Edge { from, to, req };
-        if !self.edges.contains(&edge) {
-            self.edges.push(edge);
+        if !self.edges_from(from).any(|e| e.to == to && e.req == req) {
+            self.push_edge(Edge { from, to, req });
         }
     }
 
+    fn push_node(&mut self, node: Node) -> NodeId {
+        let id = self.nodes.len();
+        let ids = self.index.by_name.entry(node.name.clone()).or_default();
+        ids.push(id);
+        self.nodes.push(node);
+        self.index.outgoing.push(Vec::new());
+        self.index.incoming.push(Vec::new());
+        id
+    }
+
+    fn push_edge(&mut self, edge: Edge) {
+        let i = self.edges.len();
+        self.index.outgoing[edge.from].push(i);
+        self.index.incoming[edge.to].push(i);
+        self.edges.push(edge);
+    }
+
+    /// Nodes named `name` at `version`, in insertion order.
+    fn matching<'g>(
+        &'g self,
+        name: &str,
+        version: &'g Version,
+    ) -> impl Iterator<Item = NodeId> + 'g {
+        let ids = self.index.by_name.get(name).map_or(&[][..], Vec::as_slice);
+        ids.iter()
+            .copied()
+            .filter(move |&id| &self.nodes[id].version == version)
+    }
+
+    /// The first node named `name` at `version`, local or from the registry.
     pub fn find(&self, name: &str, version: &Version) -> Option<NodeId> {
-        self.nodes
-            .iter()
-            .position(|n| n.name == name && &n.version == version)
+        self.matching(name, version).next()
     }
 
     pub fn node(&self, id: NodeId) -> &Node {
@@ -164,29 +246,44 @@ impl DepGraph {
 
     /// Outgoing edges of `id`.
     pub fn edges_from(&self, id: NodeId) -> impl Iterator<Item = &Edge> {
-        self.edges.iter().filter(move |e| e.from == id)
+        self.adjacent(&self.index.outgoing, id)
     }
 
     /// Incoming edges of `id`.
     pub fn edges_to(&self, id: NodeId) -> impl Iterator<Item = &Edge> {
-        self.edges.iter().filter(move |e| e.to == id)
+        self.adjacent(&self.index.incoming, id)
+    }
+
+    fn adjacent<'g>(
+        &'g self,
+        adjacency: &'g [Vec<usize>],
+        id: NodeId,
+    ) -> impl Iterator<Item = &'g Edge> {
+        let edges = adjacency.get(id).map_or(&[][..], Vec::as_slice);
+        edges.iter().map(|&i| &self.edges[i])
     }
 
     /// All nodes reachable from `start` (including `start`).
     pub fn reachable_from(&self, start: NodeId) -> HashSet<NodeId> {
-        self.bfs(start, |g, n| g.edges_from(n).map(|e| e.to).collect())
+        self.bfs(start, &self.index.outgoing, |e| e.to)
     }
 
     /// All nodes from which `target` is reachable (including `target`).
     pub fn reaching(&self, target: NodeId) -> HashSet<NodeId> {
-        self.bfs(target, |g, n| g.edges_to(n).map(|e| e.from).collect())
+        self.bfs(target, &self.index.incoming, |e| e.from)
     }
 
-    fn bfs(&self, start: NodeId, next: impl Fn(&Self, NodeId) -> Vec<NodeId>) -> HashSet<NodeId> {
+    fn bfs(
+        &self,
+        start: NodeId,
+        adjacency: &[Vec<usize>],
+        other_end: fn(&Edge) -> NodeId,
+    ) -> HashSet<NodeId> {
         let mut seen = HashSet::from([start]);
         let mut queue = VecDeque::from([start]);
         while let Some(n) = queue.pop_front() {
-            for m in next(self, n) {
+            for e in self.adjacent(adjacency, n) {
+                let m = other_end(e);
                 if seen.insert(m) {
                     queue.push_back(m);
                 }
@@ -196,20 +293,22 @@ impl DepGraph {
     }
 
     /// Up to `limit` acyclic paths from any root to `target`, each starting at
-    /// a root and ending at `target`. A path is only extended to `next` if
-    /// `keep(path, next)`. Deterministic (edge insertion order).
+    /// a root and ending at `target`. `can_reach` must be
+    /// `self.reaching(target)` (callers usually have it already). A path is
+    /// only extended to `next` if `keep(path, next)`. Deterministic (edge
+    /// insertion order).
     pub fn paths_to(
         &self,
         target: NodeId,
+        can_reach: &HashSet<NodeId>,
         limit: usize,
         keep: &dyn Fn(&[NodeId], NodeId) -> bool,
     ) -> Vec<Vec<NodeId>> {
-        let can_reach = self.reaching(target);
         let mut out = Vec::new();
         for &root in &self.roots {
             if can_reach.contains(&root) {
                 let mut path = vec![root];
-                self.dfs_paths(target, &can_reach, keep, &mut path, &mut out, limit);
+                self.dfs_paths(target, can_reach, keep, &mut path, &mut out, limit);
             }
         }
         out
@@ -232,8 +331,8 @@ impl DepGraph {
             out.push(path.clone());
             return;
         }
-        let next: Vec<NodeId> = self.edges_from(last).map(|e| e.to).collect();
-        for n in next {
+        for e in self.edges_from(last) {
+            let n = e.to;
             if can_reach.contains(&n) && !path.contains(&n) && keep(path, n) {
                 path.push(n);
                 self.dfs_paths(target, can_reach, keep, path, out, limit);
@@ -594,14 +693,59 @@ mod tests {
         g.add_edge(a, p, VersionReq::new("^1"));
         g.add_edge(b, p, VersionReq::new("^1"));
         g.add_edge(p, a, VersionReq::new("^1")); // cycle
+        g.add_edge(root, a, VersionReq::new("^1")); // duplicate
+        assert_eq!(g.edges.len(), 5);
         let all = |_: &[NodeId], _: NodeId| true;
-        let paths = g.paths_to(p, 10, &all);
+        let to_p = g.reaching(p);
+        let paths = g.paths_to(p, &to_p, 10, &all);
         assert_eq!(paths, vec![vec![root, a, p], vec![root, b, p]]);
-        assert_eq!(g.paths_to(p, 1, &all).len(), 1);
+        assert_eq!(g.paths_to(p, &to_p, 1, &all).len(), 1);
         let not_via_b = |_: &[NodeId], next: NodeId| next != b;
-        assert_eq!(g.paths_to(p, 10, &not_via_b), vec![vec![root, a, p]]);
-        assert!(g.reaching(p).contains(&root));
+        assert_eq!(g.paths_to(p, &to_p, 10, &not_via_b), vec![vec![root, a, p]]);
+        assert!(to_p.contains(&root));
+        assert_eq!(g.reachable_from(b), HashSet::from([b, p, a]));
         assert_eq!(g.label(p), "p@1.0.0");
+    }
+
+    #[test]
+    fn registry_and_local_packages_of_the_same_version_stay_apart() {
+        let mut g = DepGraph::new();
+        let member = g.add_root("foo", &v("0.1.0"));
+        let app = g.add_root("app", &v("0.1.0"));
+        let crate_io = g.add_node("foo", &v("0.1.0"), true, true);
+        assert_ne!(member, crate_io);
+        assert_eq!(g.add_root("foo", &v("0.1.0")), member);
+        assert_eq!(g.add_node("foo", &v("0.1.0"), false, true), crate_io);
+        assert_eq!(g.roots, vec![member, app]);
+        assert!(!g.node(member).registry && g.node(crate_io).registry);
+        // A root added after the registry package does not take it over.
+        let bar = g.add_node("bar", &v("1.0.0"), true, true);
+        let bar_member = g.add_root("bar", &v("1.0.0"));
+        assert_ne!(bar, bar_member);
+        assert!(g.node(bar).registry && !g.node(bar_member).registry);
+        assert_eq!(g.find("foo", &v("0.1.0")), Some(member));
+        assert_eq!(g.find("foo", &v("0.2.0")), None);
+    }
+
+    #[test]
+    fn adjacency_survives_serde_and_in_place_edits() {
+        let mut g = DepGraph::new();
+        let root = g.add_root("app", &v("0.1.0"));
+        let a = g.add_node("a", &v("1.0.0"), true, true);
+        let p = g.add_node("p", &v("1.0.0"), false, true);
+        g.add_edge(root, a, VersionReq::new("^1"));
+        g.add_edge(a, p, VersionReq::new("^1"));
+        let json = serde_json::to_string(&g).unwrap();
+        assert!(!json.contains("index"), "{json}");
+        let mut back: DepGraph = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, g);
+        assert_eq!(back.edges_to(p).map(|e| e.from).collect::<Vec<_>>(), [a]);
+        assert_eq!(back.edges_from(root).map(|e| e.to).collect::<Vec<_>>(), [a]);
+        back.nodes[p].version = v("1.0.1");
+        assert_eq!(back.find("p", &v("1.0.1")), Some(p));
+        assert_eq!(back.add_node("p", &v("1.0.1"), false, true), p);
+        back.add_edge(a, p, VersionReq::new("^1"));
+        assert_eq!(back.edges.len(), 2);
     }
 
     #[test]

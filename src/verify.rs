@@ -311,12 +311,10 @@ fn check_release_age(
 
 /// Whether `node` is reachable from a direct dependency named `via`.
 fn reached_via(graph: &DepGraph, node: NodeId, via: &str) -> bool {
-    graph
-        .nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, n)| n.direct && n.name == via)
-        .any(|(id, _)| graph.reachable_from(id).contains(&node))
+    graph.reaching(node).into_iter().any(|id| {
+        let n = graph.node(id);
+        n.direct && n.name == via
+    })
 }
 
 /// A finding of this change is still present: its package, at the old
