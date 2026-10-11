@@ -117,7 +117,8 @@ build = "npm run build"
 test = "npm test"
 
 [[ignore]]
-id = "GHSA-xxxx-yyyy-zzzz"   # matches the advisory id or any alias (CVE, RUSTSEC, ...)
+id = "GHSA-xxxx-yyyy-zzzz"   # the advisory id or any alias (CVE, RUSTSEC, ...), any case;
+                             # mendr warns when it matches no advisory of the scanned packages
 reason = "not reachable: we never parse untrusted input"
 expires = 2026-12-31         # optional, inclusive (UTC); afterwards the advisory counts again
 ```
@@ -195,7 +196,11 @@ Limitations:
   [PLAN.md](PLAN.md)).
 
 OSV responses and registry metadata are cached under `$MENDR_CACHE_DIR`,
-`$XDG_CACHE_HOME/mendr` or `~/.cache/mendr`.
+`$XDG_CACHE_HOME/mendr` or `~/.cache/mendr` (empty variables are ignored; without `HOME`, a
+`mendr-<uid>` directory in the system temp directory). Entries unused for 30 days are deleted at
+startup. Failed requests (connection errors, timeouts, HTTP 408, 429 and 5xx) are retried three
+times with backoff. `MENDR_OSV_API` replaces the OSV API base URL (default
+`https://api.osv.dev/v1`), e.g. with a mirror.
 
 ## Development
 

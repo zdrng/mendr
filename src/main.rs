@@ -97,6 +97,7 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> Result<u8> {
     progress::init(cli.quiet);
+    cache::prune();
     let started = Instant::now();
     let cwd = std::env::current_dir().context("reading current directory")?;
     let mut config = Config::load(cli.config.as_deref(), &cwd)?;
@@ -144,6 +145,7 @@ fn run(cli: &Cli) -> Result<u8> {
         }
         projects.push(pr);
     }
+    osv::warn_unmatched_ignores(&config.ignores, today);
 
     let report = Report::new(mode, projects);
     let took = progress::elapsed(started);

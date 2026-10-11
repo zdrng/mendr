@@ -327,7 +327,10 @@ fn check_still_vulnerable(
     after: &Scan,
 ) -> Result<(), FailReason> {
     for f in findings {
-        let advisory = after.advisories.iter().find(|a| a.has_id(&f.advisory.id));
+        let advisory = after
+            .advisories
+            .iter()
+            .find(|a| a.has_id(&f.advisory.id) && a.mentions(eco, &f.package));
         for (id, n) in after.graph.nodes.iter().enumerate() {
             if n.name != f.package {
                 continue;
