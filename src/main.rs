@@ -145,6 +145,7 @@ fn run(cli: &Cli) -> Result<u8> {
         }
         projects.push(pr);
     }
+    osv::warn_unmatched_ignores(&config.ignores, today);
 
     let report = Report::new(mode, projects);
     let took = progress::elapsed(started);

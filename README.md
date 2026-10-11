@@ -117,7 +117,8 @@ build = "npm run build"
 test = "npm test"
 
 [[ignore]]
-id = "GHSA-xxxx-yyyy-zzzz"   # matches the advisory id or any alias (CVE, RUSTSEC, ...)
+id = "GHSA-xxxx-yyyy-zzzz"   # the advisory id or any alias (CVE, RUSTSEC, ...), any case;
+                             # mendr warns when it matches no advisory of the scanned packages
 reason = "not reachable: we never parse untrusted input"
 expires = 2026-12-31         # optional, inclusive (UTC); afterwards the advisory counts again
 ```

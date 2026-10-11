@@ -165,6 +165,16 @@ mod tests {
             ignore_match(&adv, &forever, later),
             IgnoreMatch::Active(&forever[2])
         );
+        let sloppy = vec![IgnoreRule {
+            id: " ghsa-1\n".into(),
+            reason: "hand-written".into(),
+            expires: None,
+        }];
+        assert_eq!(
+            ignore_match(&adv, &sloppy, later),
+            IgnoreMatch::Active(&sloppy[0]),
+            "ids are trimmed and compared case-insensitively"
+        );
         assert!(!ignore_expired(&rules[0], today), "inclusive");
         assert!(ignore_expired(&rules[0], later));
         assert!(!ignore_expired(&rules[1], later), "no expiry");

@@ -21,6 +21,7 @@ use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::config::IgnoreRule;
 use crate::ecosystem::Ecosystem;
 use crate::model::{DepGraph, NodeId, Version};
 
@@ -408,9 +409,60 @@ impl Advisory {
         self.is_for(eco, package)
     }
 
-    /// Whether `id` is the primary id or one of the aliases.
+    /// Whether `id` is the primary id or one of the aliases, ignoring
+    /// surrounding whitespace and ASCII case (ids in `mendr.toml` are
+    /// hand-written).
     pub fn has_id(&self, id: &str) -> bool {
-        self.id == id || self.aliases.iter().any(|a| a == id)
+        let id = id.trim();
+        std::iter::once(&self.id)
+            .chain(&self.aliases)
+            .any(|a| a.eq_ignore_ascii_case(id))
+    }
+}
+
+/// Ids and aliases (see [`normalize_id`]) of every advisory returned by
+/// [`Osv::advisories`] in this process, for [`warn_unmatched_ignores`].
+static SEEN_IDS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// An advisory id as [`Advisory::has_id`] compares it.
+fn normalize_id(id: &str) -> String {
+    id.trim().to_ascii_uppercase()
+}
+
+fn remember_ids(advisories: &[Advisory]) {
+    let mut seen = SEEN_IDS.lock().unwrap_or_else(|e| e.into_inner());
+    for a in advisories {
+        seen.extend(
+            std::iter::once(&a.id)
+                .chain(&a.aliases)
+                .map(|id| normalize_id(id)),
+        );
+    }
+}
+
+/// Rules (not expired on `today`) whose id is not in `seen`.
+fn unmatched_ignores<'a>(
+    ignores: &'a [IgnoreRule],
+    seen: &BTreeSet<String>,
+    today: jiff::civil::Date,
+) -> Vec<&'a IgnoreRule> {
+    ignores
+        .iter()
+        .filter(|r| !crate::rules::ignore_expired(r, today) && !seen.contains(&normalize_id(&r.id)))
+        .collect()
+}
+
+/// Warn about `[[ignore]]` rules that matched no advisory of the packages
+/// scanned so far (a typo, or no longer needed). Call after all projects.
+/// Expired rules are skipped: they already get their own warning.
+pub fn warn_unmatched_ignores(ignores: &[IgnoreRule], today: jiff::civil::Date) {
+    let seen = SEEN_IDS.lock().unwrap_or_else(|e| e.into_inner());
+    for rule in unmatched_ignores(ignores, &seen, today) {
+        crate::progress::warn(format!(
+            "[[ignore]] entry for {} matched no advisory of the scanned packages \
+             (check the id, or remove the entry if it is no longer needed)",
+            rule.id.trim()
+        ));
     }
 }
 
@@ -725,6 +777,7 @@ impl Osv {
                 .as_ref()
                 .is_some_and(|p| wanted.contains(p.name.as_str()) && a.is_for(eco, &p.name))
         });
+        remember_ids(&advisories);
         Ok(advisories)
     }
 }
@@ -1076,6 +1129,42 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn unmatched_ignore_rules() {
+        let mut a = ranged("GHSA-abcd-efgh", "p", serde_json::json!([]));
+        a.aliases = vec!["CVE-2020-1".into()];
+        let advisories = dedupe(vec![a]);
+        assert!(advisories[0].has_id(" ghsa-ABCD-efgh "));
+        assert!(advisories[0].has_id("cve-2020-1"));
+        assert!(!advisories[0].has_id("GHSA-abcd"));
+
+        let mut seen = BTreeSet::new();
+        for a in &advisories {
+            seen.extend(
+                std::iter::once(&a.id)
+                    .chain(&a.aliases)
+                    .map(|id| normalize_id(id)),
+            );
+        }
+        let rule = |id: &str, expires: Option<jiff::civil::Date>| IgnoreRule {
+            id: id.into(),
+            reason: "r".into(),
+            expires,
+        };
+        let today = jiff::civil::date(2026, 6, 1);
+        let rules = [
+            rule("ghsa-abcd-efgh", None),
+            rule(" CVE-2020-1", None),
+            rule("GHSA-typo", None),
+            rule("GHSA-old", Some(jiff::civil::date(2026, 1, 1))),
+        ];
+        let unmatched: Vec<&str> = unmatched_ignores(&rules, &seen, today)
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(unmatched, vec!["GHSA-typo"], "expired rules warn elsewhere");
     }
 
     #[test]
