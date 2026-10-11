@@ -10,7 +10,8 @@
 //! namespace (`cargo-index`, `crates-io`, `npm`, `pnpm`). Cache failures are never
 //! fatal: reads return `None`, writes are best-effort.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 /// Root cache directory (not created until something is written).
@@ -54,13 +55,17 @@ fn file_name(key: &str) -> String {
     }
 }
 
-pub fn path(namespace: &str, key: &str) -> PathBuf {
-    cache_dir().join(namespace).join(file_name(key))
+fn path_in(root: &Path, namespace: &str, key: &str) -> PathBuf {
+    root.join(namespace).join(file_name(key))
 }
 
 /// Cached value, if present and (when `max_age` is given) younger than it.
 pub fn read(namespace: &str, key: &str, max_age: Option<Duration>) -> Option<String> {
-    let p = path(namespace, key);
+    read_in(&cache_dir(), namespace, key, max_age)
+}
+
+fn read_in(root: &Path, namespace: &str, key: &str, max_age: Option<Duration>) -> Option<String> {
+    let p = path_in(root, namespace, key);
     if let Some(max_age) = max_age {
         let modified = std::fs::metadata(&p).ok()?.modified().ok()?;
         let age = SystemTime::now()
@@ -75,12 +80,25 @@ pub fn read(namespace: &str, key: &str, max_age: Option<Duration>) -> Option<Str
 
 /// Store a value (best-effort; errors are ignored).
 pub fn write(namespace: &str, key: &str, value: &str) {
-    let p = path(namespace, key);
+    write_in(&cache_dir(), namespace, key, value)
+}
+
+fn write_in(root: &Path, namespace: &str, key: &str, value: &str) {
+    let p = path_in(root, namespace, key);
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     // Write to a temp file then rename, so readers never see partial data.
-    let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+    // The name is unique per key, process and call: `with_extension` would cut
+    // keys at their last dot and let concurrent writers share one temp file.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let Some(name) = p.file_name() else { return };
+    let tmp = p.with_file_name(format!(
+        "{}.tmp{}.{}",
+        name.to_string_lossy(),
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     if std::fs::write(&tmp, value).is_ok() {
         let _ = std::fs::rename(&tmp, &p);
     }
@@ -98,5 +116,22 @@ mod tests {
         assert_ne!(a, b);
         assert!(!a.contains('/'));
         assert!(!file_name("..").starts_with('.'));
+    }
+
+    #[test]
+    fn concurrent_writes_of_dotted_keys_stay_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let keys: Vec<String> = (0..16)
+            .map(|i| format!("registry.npmjs.org/pkg{i}"))
+            .collect();
+        std::thread::scope(|s| {
+            for k in &keys {
+                s.spawn(move || write_in(root, "t", k, k));
+            }
+        });
+        for k in &keys {
+            assert_eq!(read_in(root, "t", k, None).as_deref(), Some(k.as_str()));
+        }
     }
 }
