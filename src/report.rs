@@ -238,7 +238,7 @@ fn project_markdown(out: &mut String, p: &ProjectReport) {
                 out,
                 "| {} | {} | {} |",
                 change_text(c),
-                cell(&ids.join(", ")),
+                ids.iter().map(|id| text(id)).collect::<Vec<_>>().join(", "),
                 result
             );
         }
@@ -254,7 +254,7 @@ fn project_markdown(out: &mut String, p: &ProjectReport) {
         let title = a
             .summary
             .as_deref()
-            .map(|s| format!(" \"{}\"", cell(&s.replace('"', "'"))))
+            .map(|s| format!(" \"{}\"", link_title(s)))
             .unwrap_or_default();
         let severity = match &a.severity {
             Some(s) => match s.score {
@@ -265,12 +265,13 @@ fn project_markdown(out: &mut String, p: &ProjectReport) {
         };
         let _ = writeln!(
             out,
-            "| [{id}](https://osv.dev/vulnerability/{id}{title}) | {severity} | {} | {} | {} | {} |",
+            "| [{id}](https://osv.dev/vulnerability/{path}{title}) | {severity} | {} | {} | {} | {} |",
             code(&format!("{}@{}", f.package, f.version)),
             code(&f.via.name),
             f.change.as_ref().map_or("-".into(), change_text),
             outcome_short(&f.outcome),
-            id = a.id,
+            id = text(&a.id),
+            path = url_segment(&a.id),
         );
     }
     out.push('\n');
@@ -325,7 +326,7 @@ fn project_markdown(out: &mut String, p: &ProjectReport) {
 fn finding_subject(f: &Finding) -> String {
     format!(
         "{} in {}",
-        f.advisory.id,
+        text(&f.advisory.id),
         code(&format!("{}@{}", f.package, f.version))
     )
 }
@@ -506,8 +507,9 @@ fn fail_text(r: &FailReason) -> String {
             package,
             version,
         } => format!(
-            "the change introduces {}, affected by {advisory}.",
-            code(&format!("{package}@{version}"))
+            "the change introduces {}, affected by {}.",
+            code(&format!("{package}@{version}")),
+            text(advisory)
         ),
         FailReason::StillVulnerable { package, version } => format!(
             "{} is still in the dependency graph after the change.",
@@ -552,6 +554,40 @@ fn code(s: &str) -> String {
 /// Text safe inside a table cell: one line, `|` escaped.
 fn cell(s: &str) -> String {
     one_line(s).replace('|', "\\|")
+}
+
+/// Plain text (advisory ids) safe in table cells and link texts: Markdown
+/// punctuation that could start emphasis, code, links or HTML is
+/// backslash-escaped.
+fn text(s: &str) -> String {
+    let mut out = String::new();
+    for c in one_line(s).chars() {
+        if matches!(c, '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '|') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A link title for use inside `"..."`: `\` escaped (a trailing one would
+/// eat the closing quote), `"` replaced by `'`, safe in table cells.
+fn link_title(s: &str) -> String {
+    cell(&s.replace('\\', "\\\\").replace('"', "'"))
+}
+
+/// `s` percent-encoded for a URL path segment (everything but RFC 3986
+/// unreserved characters).
+fn url_segment(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn one_line(s: &str) -> String {
@@ -714,5 +750,35 @@ mod tests {
         }
         // The shared build failure is explained once.
         assert_eq!(md.matches("<details>").count(), 1, "{md}");
+    }
+
+    #[test]
+    fn markdown_escapes_hostile_ids_and_summaries() {
+        let mut f = finding(Outcome::Skipped {
+            reason: SkipReason::NoPatchedVersion {
+                package: "p".into(),
+            },
+        });
+        f.advisory.id = "X](javascript:x) <b>|*".into();
+        f.advisory.summary = Some("ends with a backslash \\".into());
+        let mut p = ProjectReport::new(Path::new("/r"), Path::new("/r"));
+        p.findings = vec![f];
+        let md = Report::new(Mode::Plan, vec![p]).to_markdown();
+        let row = md
+            .lines()
+            .find(|l| l.contains("osv.dev"))
+            .expect("findings row");
+        assert!(
+            row.starts_with(
+                "| [X\\](javascript:x) \\<b\\>\\|\\*](https://osv.dev/vulnerability/\
+                 X%5D%28javascript%3Ax%29%20%3Cb%3E%7C%2A \"ends with a backslash \\\\\") |"
+            ),
+            "{row}"
+        );
+        assert!(
+            md.contains("- X\\](javascript:x) \\<b\\>\\|\\* in `p@1.0.0`"),
+            "{md}"
+        );
+        assert_eq!(link_title("a \"b\" c|d \\"), "a 'b' c\\|d \\\\");
     }
 }
