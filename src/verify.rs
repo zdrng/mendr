@@ -44,7 +44,8 @@
 //! `--write` ([`write_back`]) copies back exactly the files `apply` changed
 //! for the kept changes, with their content captured right after `apply`
 //! (before any build ran), so build and test output never reaches the user's
-//! project.
+//! project. It refuses if any of these files changed since the copy, and
+//! replaces them by renaming temp files written next to them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -84,6 +85,10 @@ pub struct Verified {
     /// Files (relative to the project) changed by the kept changes, with their
     /// content right after `apply`; `None` = deleted.
     pub files: BTreeMap<PathBuf, Option<Vec<u8>>>,
+    /// The same paths with their content when the project was copied
+    /// (`None` = did not exist). [`write_back`] refuses to overwrite files
+    /// that no longer match.
+    pub originals: BTreeMap<PathBuf, Option<Vec<u8>>>,
 }
 
 /// Verify `plan.changes` in a temporary copy and update every finding's
@@ -107,6 +112,9 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
         .join(root.file_name().unwrap_or("project".as_ref()));
     copy_tree(&root, &work, excludes)
         .with_context(|| format!("copying {} to {}", root.display(), work.display()))?;
+    // The user's files as we copied them, before any command ran.
+    let originals =
+        snapshot(Tracked::of(ctx.eco), &work).context("snapshotting the project copy")?;
 
     let step = progress::begin("Baseline", "install, build and test in a temporary copy");
     if let Err(reason) = run_steps(ctx, &work, true) {
@@ -195,34 +203,92 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
 
     check_interrupted();
     set_outcomes(plan, &kept, &failed, None);
-    Ok(Verified { files })
+    let originals = files
+        .keys()
+        .map(|rel| (rel.clone(), originals.get(rel).cloned()))
+        .collect();
+    Ok(Verified { files, originals })
 }
 
 /// `--write`: write the files changed by the kept changes (manifests and
 /// lockfiles, as captured right after `apply`) into the project. Returns the
 /// paths written or removed.
+///
+/// Refuses (writing nothing) if any of these files changed since the
+/// project was copied. New contents are first written to temp files next
+/// to their targets, then renamed over them, then deletions are done: a
+/// failure while preparing leaves the project untouched.
 pub fn write_back(ctx: &VerifyContext, verified: &Verified) -> Result<Vec<PathBuf>> {
+    use std::os::unix::fs::PermissionsExt;
+
     // Not interrupted half-way: a signal takes effect afterwards.
     let _defer = defer_signals();
     check_interrupted();
-    let mut written = Vec::new();
-    for (rel, content) in &verified.files {
-        let path = ctx.project.path.join(rel);
-        match content {
-            Some(bytes) => {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
-            }
-            None if path.exists() => {
-                fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?
-            }
-            None => continue,
+    let root = &ctx.project.path;
+
+    let mut changed = Vec::new();
+    for rel in verified.files.keys() {
+        let path = root.join(rel);
+        let now = read_if_exists(&path).with_context(|| format!("reading {}", path.display()))?;
+        if verified.originals.get(rel).cloned().flatten() != now {
+            changed.push(format!("  - {}", path.display()));
         }
+    }
+    if !changed.is_empty() {
+        anyhow::bail!(
+            "not writing back: these files changed since mendr copied the project\n{}\n\
+             Re-run mendr on the current state.",
+            changed.join("\n")
+        );
+    }
+
+    let mut staged = Vec::new();
+    let mut removals = Vec::new();
+    for (rel, content) in &verified.files {
+        let path = root.join(rel);
+        let Some(bytes) = content else {
+            if path.exists() {
+                removals.push(path);
+            }
+            continue;
+        };
+        let stage = || -> io::Result<tempfile::NamedTempFile> {
+            let parent = path.parent().unwrap_or(root);
+            fs::create_dir_all(parent)?;
+            let mut tmp = tempfile::Builder::new()
+                .prefix(".mendr-")
+                .tempfile_in(parent)?;
+            io::Write::write_all(&mut tmp, bytes)?;
+            let mode = fs::metadata(&path).map_or(0o644, |m| m.permissions().mode() & 0o7777);
+            tmp.as_file()
+                .set_permissions(fs::Permissions::from_mode(mode))?;
+            Ok(tmp)
+        };
+        let tmp = stage().with_context(|| format!("preparing {}", path.display()))?;
+        staged.push((tmp, path));
+    }
+
+    let mut written = Vec::new();
+    for (tmp, path) in staged {
+        tmp.persist(&path)
+            .with_context(|| format!("writing {}", path.display()))?;
         written.push(path);
     }
+    for path in removals {
+        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        written.push(path);
+    }
+    written.sort();
     Ok(written)
+}
+
+/// The content of `path`, `None` if it does not exist.
+fn read_if_exists(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 // ---- One change ------------------------------------------------------------------
@@ -1165,6 +1231,114 @@ mod tests {
             fs::read_to_string(r.project.path().join("src/main.txt")).unwrap(),
             "code"
         );
+    }
+
+    #[test]
+    fn write_back_refuses_when_the_project_changed() {
+        let s = setup();
+        let r = run(&s);
+        let lock = r.project.path().join(LOCKFILE);
+        assert_eq!(
+            r.verified.originals[Path::new(LOCKFILE)].as_deref(),
+            Some(fs::read(&lock).unwrap().as_slice())
+        );
+        fs::write(&lock, "edited meanwhile").unwrap();
+        let project = ProjectConfig::at(r.project.path().to_path_buf());
+        let err = write_back(&ctx(&s, &project), &r.verified).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("changed since mendr copied"), "{err}");
+        assert!(err.contains(LOCKFILE), "{err}");
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "edited meanwhile");
+    }
+
+    /// `Verified` for `(path, original, new)` triples; `None` = absent.
+    fn verified(files: &[(&str, Option<&str>, Option<&str>)]) -> Verified {
+        let bytes = |s: &Option<&str>| s.map(|s| s.as_bytes().to_vec());
+        Verified {
+            files: files
+                .iter()
+                .map(|(p, _, new)| (PathBuf::from(p), bytes(new)))
+                .collect(),
+            originals: files
+                .iter()
+                .map(|(p, old, _)| (PathBuf::from(p), bytes(old)))
+                .collect(),
+        }
+    }
+
+    /// Names of all entries below `dir`, sorted.
+    fn tree(dir: &Path) -> Vec<String> {
+        let mut out: Vec<String> = list_files(dir, &[])
+            .unwrap()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn write_back_writes_creates_and_deletes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let s = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        fs::write(d.join("a.lock"), "old").unwrap();
+        fs::set_permissions(d.join("a.lock"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(d.join("b.json"), "b").unwrap();
+        let v = verified(&[
+            ("a.lock", Some("old"), Some("new")),
+            ("b.json", Some("b"), None),
+            ("sub/c.json", None, Some("c")),
+        ]);
+        let project = ProjectConfig::at(d.to_path_buf());
+        let written = write_back(&ctx(&s, &project), &v).unwrap();
+        assert_eq!(
+            written,
+            ["a.lock", "b.json", "sub/c.json"].map(|p| d.join(p))
+        );
+        assert_eq!(tree(d), ["a.lock", "sub/c.json"]);
+        assert_eq!(fs::read_to_string(d.join("a.lock")).unwrap(), "new");
+        assert_eq!(fs::read_to_string(d.join("sub/c.json")).unwrap(), "c");
+        let mode = |p: &str| fs::metadata(d.join(p)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode("a.lock"), 0o600, "permissions kept");
+        assert_eq!(mode("sub/c.json"), 0o644);
+
+        // Deleted meanwhile: refused too.
+        let v = verified(&[
+            ("a.lock", Some("new"), Some("newer")),
+            ("x", Some("x"), None),
+        ]);
+        assert!(write_back(&ctx(&s, &project), &v).is_err());
+        assert_eq!(fs::read_to_string(d.join("a.lock")).unwrap(), "new");
+    }
+
+    #[test]
+    fn write_back_failure_while_preparing_writes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let s = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        fs::write(d.join("a.lock"), "old").unwrap();
+        fs::create_dir(d.join("ro")).unwrap();
+        fs::write(d.join("ro/m.json"), "m").unwrap();
+        fs::set_permissions(d.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(d.join("ro/probe"), "").is_ok() {
+            return; // running as root: permissions are not enforced
+        }
+        let v = verified(&[
+            ("a.lock", Some("old"), Some("new")),
+            ("ro/m.json", Some("m"), Some("changed")),
+        ]);
+        let project = ProjectConfig::at(d.to_path_buf());
+        let err = write_back(&ctx(&s, &project), &v).unwrap_err();
+        assert!(format!("{err:#}").contains("ro/m.json"), "{err:#}");
+        fs::set_permissions(d.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(fs::read_to_string(d.join("a.lock")).unwrap(), "old");
+        assert_eq!(fs::read_to_string(d.join("ro/m.json")).unwrap(), "m");
+        assert_eq!(tree(d), ["a.lock", "ro/m.json"], "no temp files left");
     }
 
     #[test]
