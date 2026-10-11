@@ -189,8 +189,34 @@ struct Target<'b> {
     advisories: Vec<&'b Advisory>,
 }
 
-/// Settled [`Planner::subtree_ok`] results per `(package, version)`.
-type Memo = HashMap<(String, Version), bool>;
+/// Settled [`Planner::subtree_ok`] answers per `(package, version)`, with
+/// the smallest depth each may be reused at (see [`Subtree::cut`]).
+type Memo = HashMap<(String, Version), (bool, usize)>;
+
+/// Answer of [`Planner::subtree_ok`] for one node.
+#[derive(Clone, Copy)]
+struct Subtree {
+    ok: bool,
+    /// Smallest depth of an in-progress node assumed fine (`usize::MAX` if
+    /// none).
+    assumed: usize,
+    /// Whether a depth cut assumed something fine. Such an answer is reused
+    /// only at the depth it was computed at or deeper, where a fresh walk
+    /// would not look further.
+    cut: bool,
+}
+
+impl Subtree {
+    const OK: Subtree = Subtree {
+        ok: true,
+        assumed: usize::MAX,
+        cut: false,
+    };
+    const FAIL: Subtree = Subtree {
+        ok: false,
+        ..Self::OK
+    };
+}
 
 /// State of the [`Planner::subtree_ok`] walks for one target and corridor.
 struct Walk<'w> {
@@ -644,7 +670,7 @@ impl<'a> Planner<'a> {
                             if via_advisories
                                 .iter()
                                 .any(|a| a.affects(eco, &via.name, &c.version))
-                                || !s.subtree_ok(&via.name, &c.version, &mut walk, 0)?.0
+                                || !s.subtree_ok(&via.name, &c.version, &mut walk, 0)?.ok
                             {
                                 return Ok(Verdict::Reject);
                             }
@@ -720,9 +746,9 @@ impl<'a> Planner<'a> {
             return false;
         }
         let mut walk = self.walk(&target, &goal.corridor);
-        let ok = self.subtree_ok(package, to, &mut walk, 0);
+        let answer = self.subtree_ok(package, to, &mut walk, 0);
         self.store(walk);
-        ok.is_ok_and(|(ok, _)| ok)
+        answer.is_ok_and(|a| a.ok)
     }
 
     /// Start walks for `target` through `corridor`, with the results
@@ -753,8 +779,7 @@ impl<'a> Planner<'a> {
 
     /// Whether `package@version` (a candidate version of the group's direct
     /// dependency, or a package below it) can resolve to a non-vulnerable
-    /// target package. Also returns the smallest depth of an in-progress
-    /// node the answer assumed fine (`usize::MAX` if none).
+    /// target package.
     ///
     /// Only dependencies that lead to the target in the current graph (the
     /// walk's corridor) are followed, each resolved to what a fresh
@@ -765,58 +790,71 @@ impl<'a> Planner<'a> {
     /// rescans.
     ///
     /// Cycles and subtrees below [`MAX_DEPTH`] are assumed fine. A failure
-    /// is final, but a success that relied on such an assumption is only
-    /// memoized by the node it relied on (or, for a depth cut, the root).
+    /// is final; a success that assumed an in-progress node fine is only
+    /// memoized once that node is settled.
     fn subtree_ok(
         &mut self,
         package: &str,
         version: &Version,
         walk: &mut Walk,
         depth: usize,
-    ) -> Result<(bool, usize), AdapterError> {
+    ) -> Result<Subtree, AdapterError> {
         let key = (package.to_string(), version.clone());
-        if let Some(&ok) = walk.memo.get(&key) {
-            return Ok((ok, usize::MAX));
+        if let Some(&(ok, from)) = walk.memo.get(&key)
+            && depth >= from
+        {
+            return Ok(Subtree {
+                cut: from > 0,
+                ..if ok { Subtree::OK } else { Subtree::FAIL }
+            });
         }
         if let Some(&d) = walk.stack.get(&key) {
-            return Ok((true, d)); // cycle
+            // A cycle: fine as far as this node is concerned.
+            return Ok(Subtree {
+                assumed: d,
+                ..Subtree::OK
+            });
         }
         walk.stack.insert(key.clone(), depth);
         let eco = self.eco();
-        let mut assumed = usize::MAX;
-        let mut ok = true;
+        let mut answer = Subtree::OK;
         for dep in self.dependencies_of(package, version)?.iter() {
             if dep.optional && !self.edge_names.contains(&(package, dep.name.as_str())) {
                 continue;
             }
-            let (dep_ok, dep_assumed) = if dep.name == walk.target.name {
+            let sub = if dep.name == walk.target.name {
                 let picked = self.pick(&dep.name, &dep.req)?;
-                let safe = picked.is_some_and(|v| walk.target.is_safe(eco, &v));
-                (safe, usize::MAX)
+                if picked.is_some_and(|v| walk.target.is_safe(eco, &v)) {
+                    Subtree::OK
+                } else {
+                    Subtree::FAIL
+                }
             } else if !walk.corridor.contains(&dep.name) {
                 continue;
             } else if depth >= MAX_DEPTH {
-                (true, 0)
+                Subtree {
+                    cut: true,
+                    ..Subtree::OK
+                }
             } else {
                 match self.pick(&dep.name, &dep.req)? {
                     Some(v) => self.subtree_ok(&dep.name, &v, walk, depth + 1)?,
-                    None => (false, usize::MAX),
+                    None => Subtree::FAIL,
                 }
             };
-            if !dep_ok {
-                ok = false;
+            if !sub.ok {
+                answer = Subtree::FAIL;
                 break;
             }
-            assumed = assumed.min(dep_assumed);
+            answer.assumed = answer.assumed.min(sub.assumed);
+            answer.cut |= sub.cut;
         }
         walk.stack.remove(&key);
-        if !ok {
-            assumed = usize::MAX;
+        if answer.assumed >= depth {
+            let from = if answer.cut { depth } else { 0 };
+            walk.memo.insert(key, (answer.ok, from));
         }
-        if assumed >= depth {
-            walk.memo.insert(key, ok);
-        }
-        Ok((ok, assumed))
+        Ok(answer)
     }
 }
 
@@ -1772,6 +1810,55 @@ mod tests {
             let plan = run(&f, &[adv("A-1", "p", "0", "1.0.1")], &policy());
             assert_eq!(only(&plan).outcome.label(), expected, "chain of {len}");
         }
+    }
+
+    #[test]
+    fn wide_corridors_below_max_depth_are_walked_once_per_depth() {
+        // root -> a -> 12 layers of 5 packages, each depending on every
+        // package of the next layer -> p, pinned by the last layer. A walk
+        // that never reused cut-off answers would visit 5^MAX_DEPTH paths.
+        let mut f = Fake::new();
+        let root = f.root("app", "0.1.0");
+        let layers: Vec<Vec<String>> = (0..12)
+            .map(|l| (0..5).map(|i| format!("l{l}x{i}")).collect())
+            .collect();
+        let reqs = |names: &[String]| -> Vec<(String, String)> {
+            names.iter().map(|n| (n.clone(), "^1".into())).collect()
+        };
+        let mut parents = vec![f.dep(root, "a", "1.0.0", "^1")];
+        let mut published = vec![("a".to_string(), reqs(&layers[0]))];
+        for (l, names) in layers.iter().enumerate() {
+            let ids: Vec<NodeId> = names
+                .iter()
+                .map(|n| f.graph.add_node(n, &v("1.0.0"), false, true))
+                .collect();
+            for &from in &parents {
+                for &to in &ids {
+                    f.graph.add_edge(from, to, VersionReq::new("^1"));
+                }
+            }
+            let deps = match layers.get(l + 1) {
+                Some(next) => reqs(next),
+                None => vec![("p".into(), "=1.0.0".into())],
+            };
+            published.extend(names.iter().map(|n| (n.clone(), deps.clone())));
+            parents = ids;
+        }
+        for &id in &parents {
+            f.dep(id, "p", "1.0.0", "=1.0.0");
+        }
+        for (name, deps) in &published {
+            let deps: Vec<(&str, &str)> =
+                deps.iter().map(|(n, r)| (n.as_str(), r.as_str())).collect();
+            f.publish(name, "1.0.0", &deps);
+        }
+        let a_deps: Vec<(&str, &str)> = layers[0].iter().map(|n| (n.as_str(), "^1")).collect();
+        f.publish("a", "1.1.0", &a_deps);
+        f.publish("p", "1.0.0", &[]).publish("p", "1.0.1", &[]);
+        f.unsupported = vec![Strategy::Override];
+        let plan = run(&f, &[adv("A-1", "p", "0", "1.0.1")], &policy());
+        // The pins are below MAX_DEPTH: assumed fine.
+        assert_eq!(only(&plan).change.as_ref().unwrap().to(), &v("1.1.0"));
     }
 
     #[test]
