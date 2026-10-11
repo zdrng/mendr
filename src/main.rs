@@ -112,10 +112,6 @@ fn run(cli: &Cli) -> Result<u8> {
     })?;
     config.validate(&ecosystem::names())?;
 
-    if !cli.plan_only {
-        safety::enforce(&config.safety)?;
-    }
-
     let mut osv = match &cli.osv_snapshot {
         Some(dir) => Osv::snapshot(&cwd.join(dir))?,
         None => Osv::live(),
@@ -257,26 +253,45 @@ fn run_project(
         );
     }
 
-    if !cli.plan_only && !project_plan.changes.is_empty() {
-        let ctx = verify::VerifyContext {
-            eco: eco.as_ref(),
-            project,
-            commands: project.commands(eco.default_commands(&project.path)),
-            timeout: project.timeout,
-            policy: &config.policy,
-            ignores: &config.ignores,
-            now,
-        };
-        let verified = verify::verify(&ctx, osv, &mut project_plan)?;
-        if cli.write {
-            for file in verify::write_back(&ctx, &verified)? {
-                progress::line("Updated", display_path(&file));
-            }
-        }
-    }
-
+    let ctx = verify::VerifyContext {
+        eco: eco.as_ref(),
+        project,
+        commands: project.commands(eco.default_commands(&project.path)),
+        timeout: project.timeout,
+        policy: &config.policy,
+        ignores: &config.ignores,
+        now,
+    };
+    let result = verify_plan(cli, &ctx, osv, &mut project_plan, &mut |dir| {
+        safety::enforce(&config.safety, dir)
+    });
+    // Also on errors (e.g. a safety refusal): the plan is still worth reporting.
     report.findings = project_plan.findings;
     report.changes = project_plan.changes;
+    result
+}
+
+/// Unless `--plan-only` or there is nothing to change: run the safety
+/// checks (`safety` with the project dir; only now, so projects without
+/// fixes never need a sandbox), verify the changes and, with `--write`,
+/// write them back.
+fn verify_plan(
+    cli: &Cli,
+    ctx: &verify::VerifyContext,
+    osv: &mut Osv,
+    plan: &mut plan::ProjectPlan,
+    safety: &mut dyn FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    if cli.plan_only || plan.changes.is_empty() {
+        return Ok(());
+    }
+    safety(&ctx.project.path)?;
+    let verified = verify::verify(ctx, osv, plan)?;
+    if cli.write {
+        for file in verify::write_back(ctx, &verified)? {
+            progress::line("Updated", display_path(&file));
+        }
+    }
     Ok(())
 }
 
@@ -315,5 +330,52 @@ fn summarize(report: &Report) -> Option<String> {
             progress::count(n, "finding", "findings"),
             parts.join(", ")
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Policy;
+    use crate::ecosystem::fake::Fake;
+    use crate::model::{Change, Version};
+
+    #[test]
+    fn safety_runs_only_right_before_verifying() {
+        let fake = Fake::new();
+        let project = ProjectConfig::at(PathBuf::from("/nonexistent/project"));
+        let policy = Policy::default();
+        let ctx = verify::VerifyContext {
+            eco: &fake,
+            project: &project,
+            commands: Default::default(),
+            timeout: None,
+            policy: &policy,
+            ignores: &[],
+            now: jiff::Timestamp::now(),
+        };
+        let mut osv = Osv::Snapshot(Vec::new());
+        let mut calls = Vec::new();
+        let mut refuse = |dir: &Path| {
+            calls.push(dir.to_path_buf());
+            Err(anyhow!("refused"))
+        };
+        let full = Cli::parse_from(["mendr"]);
+        let plan_only = Cli::parse_from(["mendr", "--plan-only"]);
+        let mut nothing = plan::ProjectPlan::default();
+        let mut something = plan::ProjectPlan {
+            findings: Vec::new(),
+            changes: vec![Change::Relock {
+                package: "p".into(),
+                from: Version::new("1.0.0"),
+                to: Version::new("1.0.1"),
+            }],
+        };
+
+        verify_plan(&full, &ctx, &mut osv, &mut nothing, &mut refuse).unwrap();
+        verify_plan(&plan_only, &ctx, &mut osv, &mut something, &mut refuse).unwrap();
+        let err = verify_plan(&full, &ctx, &mut osv, &mut something, &mut refuse).unwrap_err();
+        assert_eq!(err.to_string(), "refused");
+        assert_eq!(calls, vec![project.path.clone()]);
     }
 }
