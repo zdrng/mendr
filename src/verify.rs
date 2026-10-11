@@ -1,6 +1,7 @@
 //! Verification of planned changes.
 //!
-//! 1. Copy `project.path` to a temp dir: top-level `eco.copy_excludes()` are
+//! 1. Copy `project.path` to a temp dir: top-level `eco.copy_excludes()`
+//!    and `.git` / `node_modules` at any depth ([`SKIP_ANYWHERE`]) are
 //!    skipped; symlinks are recreated only when they resolve inside the
 //!    project (absolute ones are re-pointed into the copy), all others are
 //!    skipped, so nothing outside the tree is reachable through the copy.
@@ -12,8 +13,10 @@
 //!    and nothing else runs.
 //!    Then resolve the graph and scan it (the "current" state).
 //! 3. For each change in `plan.changes` (in order), on top of the changes
-//!    kept so far: snapshot the copy -> `eco.apply(copy, change,
-//!    &ApplyOptions { release_cutoff })` (error -> `AdapterError::to_fail_reason`)
+//!    kept so far: snapshot the files `apply` may touch (named like one of
+//!    `eco.manifest_files()`, at any depth; all files if empty) ->
+//!    `eco.apply(copy, change, &ApplyOptions { release_cutoff })`
+//!    (error -> `AdapterError::to_fail_reason`)
 //!    -> record the files `apply` changed -> `eco.resolve_graph(copy)` ->
 //!    release-age check on every registry package version that is new in the
 //!    graph (`ReleaseAgePolicyViolated`; unknown publish date fails closed)
@@ -22,15 +25,17 @@
 //!    an advisory/package pair that was not there before and is neither
 //!    ignored nor below `min-severity` -> `NewVulnerabilityIntroduced`) ->
 //!    install/build/test (`InstallFailed`/`BuildFailed`/`TestFailed`/`Timeout`).
-//!    Keep on success, otherwise restore the snapshot. A failing change never
+//!    Keep on success, otherwise restore the snapshotted files (other state
+//!    the commands left behind stays, see 4). A failing change never
 //!    stops the others. A change whose `package@from` is no longer in the
 //!    graph (moved by an earlier kept change) is not applied: it is kept if
 //!    the rescan shows its findings fixed, else `StillVulnerable`.
 //! 4. Because changes are applied cumulatively, the last kept change was
 //!    already built and tested together with all earlier kept ones. Only if
-//!    a later attempt was reverted (its install/build may have left state in
-//!    excluded dirs such as `node_modules`) are install/build/test run once
-//!    more on the combined state; if that fails, every kept change fails
+//!    a later attempt was reverted after its commands ran (they may have left
+//!    state behind, e.g. in `node_modules` or build output) are
+//!    install/build/test run once more on the combined state; if that fails,
+//!    every kept change fails
 //!    with that reason and nothing is written back.
 //! 5. Findings whose `change` was kept become `Outcome::Fixed { strategy,
 //!    change }`; others become `Outcome::Failed { reason }` with the reason of
@@ -100,8 +105,7 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
         .path()
         .join("copy")
         .join(root.file_name().unwrap_or("project".as_ref()));
-    let snap = tmp.path().join("snapshot");
-    copy_tree(&root, &work, excludes, true)
+    copy_tree(&root, &work, excludes)
         .with_context(|| format!("copying {} to {}", root.display(), work.display()))?;
 
     let step = progress::begin("Baseline", "install, build and test in a temporary copy");
@@ -146,7 +150,8 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
             }
             continue;
         }
-        copy_tree(&work, &snap, excludes, false).context("snapshotting the project copy")?;
+        let snap =
+            snapshot(Tracked::of(ctx.eco), &work).context("snapshotting the project copy")?;
         match try_change(ctx, osv, &work, &snap, change, &findings, &current) {
             Ok((after, changed)) => {
                 step.done("Kept", change);
@@ -155,17 +160,20 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
                 kept.push(change.clone());
                 dirty = false;
             }
-            Err(reason) => {
+            Err(Reverted {
+                reason,
+                ran_commands,
+            }) => {
                 step.failed(
                     "Reverted",
                     format!("{change}: {}", describe_reason(&reason)),
                 );
-                restore(&snap, &work, excludes).context("restoring the project copy")?;
+                restore(Tracked::of(ctx.eco), &work, &snap)
+                    .context("restoring the project copy")?;
                 failed.insert(change.clone(), reason);
-                dirty = true;
+                dirty |= ran_commands;
             }
         }
-        fs::remove_dir_all(&snap).context("removing snapshot")?;
     }
 
     if dirty && !kept.is_empty() {
@@ -225,13 +233,46 @@ struct Scan {
     advisories: Vec<Advisory>,
 }
 
+/// Files that differ from a snapshot, with their new content; `None` =
+/// deleted.
 type ChangedFiles = Vec<(PathBuf, Option<Vec<u8>>)>;
+
+/// A change that was not kept.
+struct Reverted {
+    reason: FailReason,
+    /// Whether install/build/test ran for it (and may have left state
+    /// behind in the copy).
+    ran_commands: bool,
+}
 
 fn try_change(
     ctx: &VerifyContext,
     osv: &mut Osv,
     work: &Path,
-    snap: &Path,
+    snap: &Snapshot,
+    change: &Change,
+    findings: &[&Finding],
+    before: &Scan,
+) -> Result<(Scan, ChangedFiles), Reverted> {
+    let (after, changed) = apply_and_check(ctx, osv, work, snap, change, findings, before)
+        .map_err(|reason| Reverted {
+            reason,
+            ran_commands: false,
+        })?;
+    run_steps(ctx, work, false).map_err(|reason| Reverted {
+        reason,
+        ran_commands: true,
+    })?;
+    Ok((after, changed))
+}
+
+/// Apply `change`, record the files it changed, rescan and run the checks
+/// that need no build.
+fn apply_and_check(
+    ctx: &VerifyContext,
+    osv: &mut Osv,
+    work: &Path,
+    snap: &Snapshot,
     change: &Change,
     findings: &[&Finding],
     before: &Scan,
@@ -242,19 +283,13 @@ fn try_change(
     ctx.eco
         .apply(work, change, &opts)
         .map_err(|e| e.to_fail_reason())?;
-    let changed = changed_files(snap, work, ctx.eco.copy_excludes())
-        .map_err(|e| error(format!("comparing the project copy: {e}")))?
-        .into_iter()
-        .map(|rel| {
-            let content = fs::read(work.join(&rel)).ok();
-            (rel, content)
-        })
-        .collect();
+    let now = snapshot(Tracked::of(ctx.eco), work)
+        .map_err(|e| error(format!("comparing the project copy: {e}")))?;
+    let changed = diff(snap, &now);
     let after = scan(ctx, osv, work)?;
     check_release_age(ctx, &before.graph, &after.graph)?;
     check_still_vulnerable(ctx.eco, findings, &after)?;
     check_new_vulnerabilities(ctx, before, &after)?;
-    run_steps(ctx, work, false)?;
     Ok((after, changed))
 }
 
@@ -766,14 +801,24 @@ pub fn catch_interrupt<T>(f: impl FnOnce() -> T) -> Result<T, Interrupted> {
 
 // ---- Files -----------------------------------------------------------------------------
 
+/// Directories skipped at any depth when copying and walking the project:
+/// Git metadata (large, and may hold credentials in remote URLs) and npm
+/// install trees (recreated by the install step).
+const SKIP_ANYWHERE: &[&str] = &[".git", "node_modules"];
+
+/// Whether the walk skips the entry `name` in a directory at `depth` (0 =
+/// the project root).
+fn skipped(name: &std::ffi::OsStr, depth: usize, excludes: &[&str]) -> bool {
+    SKIP_ANYWHERE.iter().any(|e| name == *e) || (depth == 0 && excludes.iter().any(|e| name == *e))
+}
+
 /// Copy the directory `from` to `to` (created), skipping the top-level
-/// `excludes`. With `vet_links`, a symlink is recreated only if it resolves
-/// inside `from` (absolute targets are re-pointed into `to`) and skipped
-/// otherwise; without it symlinks are copied verbatim (for snapshots of an
-/// already vetted copy). Other special files are skipped.
-fn copy_tree(from: &Path, to: &Path, excludes: &[&str], vet_links: bool) -> io::Result<()> {
+/// `excludes` and [`SKIP_ANYWHERE`]. A symlink is recreated only if it
+/// resolves inside `from` (absolute targets are re-pointed into `to`) and
+/// skipped otherwise. Other special files are skipped.
+fn copy_tree(from: &Path, to: &Path, excludes: &[&str]) -> io::Result<()> {
     let root = from.canonicalize()?;
-    copy_dir(&root, &root, to, to, excludes, vet_links)
+    copy_dir(&root, &root, to, to, excludes, 0)
 }
 
 fn copy_dir(
@@ -782,27 +827,23 @@ fn copy_dir(
     dst_root: &Path,
     dst: &Path,
     excludes: &[&str],
-    vet_links: bool,
+    depth: usize,
 ) -> io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let name = entry.file_name();
-        if excludes.iter().any(|e| name == *e) {
+        if skipped(&name, depth, excludes) {
             continue;
         }
         let (s, d) = (entry.path(), dst.join(&name));
         let kind = entry.file_type()?;
         if kind.is_dir() {
-            copy_dir(root, &s, dst_root, &d, &[], vet_links)?;
+            copy_dir(root, &s, dst_root, &d, excludes, depth + 1)?;
         } else if kind.is_file() {
             fs::copy(&s, &d)?;
         } else if kind.is_symlink() {
             let target = fs::read_link(&s)?;
-            if !vet_links {
-                std::os::unix::fs::symlink(&target, &d)?;
-                continue;
-            }
             match s.canonicalize() {
                 Ok(resolved) if resolved.starts_with(root) => {
                     let link = if target.is_absolute() {
@@ -823,40 +864,92 @@ fn copy_dir(
     Ok(())
 }
 
-/// Make `dir` equal to `snapshot` again. Top-level `excludes` in `dir` are
-/// left alone (the snapshot does not contain them).
-fn restore(snapshot: &Path, dir: &Path, excludes: &[&str]) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if excludes.iter().any(|e| entry.file_name() == *e) {
-            continue;
-        }
-        if entry.file_type()?.is_dir() {
-            fs::remove_dir_all(entry.path())?;
-        } else {
-            fs::remove_file(entry.path())?;
+/// Contents of the files a change can touch, by path relative to the copy.
+type Snapshot = BTreeMap<PathBuf, Vec<u8>>;
+
+/// Which files [`snapshot`] takes: `Ecosystem::copy_excludes` and
+/// `Ecosystem::manifest_files`.
+#[derive(Clone, Copy)]
+struct Tracked<'a> {
+    excludes: &'a [&'a str],
+    /// File names to take; empty = all.
+    names: &'a [&'a str],
+}
+
+impl<'a> Tracked<'a> {
+    fn of(eco: &'a dyn Ecosystem) -> Self {
+        Tracked {
+            excludes: eco.copy_excludes(),
+            names: eco.manifest_files(),
         }
     }
-    copy_tree(snapshot, dir, &[], false)
+}
+
+/// The tracked regular files below `dir`.
+fn snapshot(tracked: Tracked, dir: &Path) -> io::Result<Snapshot> {
+    let Tracked { excludes, names } = tracked;
+    let mut out = Snapshot::new();
+    for rel in list_files(dir, excludes)? {
+        let wanted = names.is_empty()
+            || rel
+                .file_name()
+                .is_some_and(|n| names.iter().any(|m| n == *m));
+        if wanted {
+            let content = fs::read(dir.join(&rel))?;
+            out.insert(rel, content);
+        }
+    }
+    Ok(out)
+}
+
+/// Files that differ from `before` in `after`, with their content there
+/// (`None` = gone).
+fn diff(before: &Snapshot, after: &Snapshot) -> ChangedFiles {
+    let paths: BTreeSet<&PathBuf> = before.keys().chain(after.keys()).collect();
+    paths
+        .into_iter()
+        .filter(|p| before.get(*p) != after.get(*p))
+        .map(|p| (p.clone(), after.get(p).cloned()))
+        .collect()
+}
+
+/// Make the snapshotted files in `dir` equal to `snap` again: rewrite
+/// changed ones, recreate deleted ones, remove new ones. Everything else
+/// (build output, install trees) is left alone.
+fn restore(tracked: Tracked, dir: &Path, snap: &Snapshot) -> io::Result<()> {
+    for (rel, content) in diff(&snapshot(tracked, dir)?, snap) {
+        let path = dir.join(&rel);
+        match content {
+            Some(content) => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&path, content)?;
+            }
+            None => fs::remove_file(&path)?,
+        }
+    }
+    Ok(())
 }
 
 /// Relative paths of regular files (symlinks are not followed) below `root`,
-/// skipping the top-level `excludes`.
+/// skipping the top-level `excludes` and [`SKIP_ANYWHERE`].
 fn list_files(root: &Path, excludes: &[&str]) -> io::Result<BTreeSet<PathBuf>> {
     fn walk(
         root: &Path,
         dir: &Path,
         excludes: &[&str],
+        depth: usize,
         out: &mut BTreeSet<PathBuf>,
     ) -> io::Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
-            if dir == root && excludes.iter().any(|e| entry.file_name() == *e) {
+            if skipped(&entry.file_name(), depth, excludes) {
                 continue;
             }
             let kind = entry.file_type()?;
             if kind.is_dir() {
-                walk(root, &entry.path(), excludes, out)?;
+                walk(root, &entry.path(), excludes, depth + 1, out)?;
             } else if kind.is_file() {
                 let path = entry.path();
                 out.insert(path.strip_prefix(root).expect("below root").to_path_buf());
@@ -865,22 +958,7 @@ fn list_files(root: &Path, excludes: &[&str]) -> io::Result<BTreeSet<PathBuf>> {
         Ok(())
     }
     let mut out = BTreeSet::new();
-    walk(root, root, excludes, &mut out)?;
-    Ok(out)
-}
-
-/// Regular files added, removed or modified between `a` and `b` (relative
-/// paths, sorted), ignoring the top-level `excludes`.
-fn changed_files(a: &Path, b: &Path, excludes: &[&str]) -> io::Result<Vec<PathBuf>> {
-    let (fa, fb) = (list_files(a, excludes)?, list_files(b, excludes)?);
-    let mut out = Vec::new();
-    for rel in fa.union(&fb) {
-        if !(fa.contains(rel) && fb.contains(rel))
-            || fs::read(a.join(rel))? != fs::read(b.join(rel))?
-        {
-            out.push(rel.clone());
-        }
-    }
+    walk(root, root, excludes, 0, &mut out)?;
     Ok(out)
 }
 
@@ -1542,34 +1620,109 @@ mod tests {
         std::os::unix::fs::symlink(p.join("src"), p.join("abs")).unwrap();
         std::os::unix::fs::symlink(outside.path().join("secret"), p.join("out")).unwrap();
         std::os::unix::fs::symlink("../..", p.join("src/up")).unwrap();
+        for dir in [
+            ".git/objects",
+            "node_modules/x",
+            "web/node_modules/y",
+            "sub/.git",
+        ] {
+            fs::create_dir_all(p.join(dir)).unwrap();
+            fs::write(p.join(dir).join("f"), "x").unwrap();
+        }
+        fs::write(p.join(".gitignore"), "target\n").unwrap();
 
         let dst = tempfile::tempdir().unwrap();
         let copy = dst.path().join("c");
-        copy_tree(&p, &copy, &["target"], true).unwrap();
+        copy_tree(&p, &copy, &["target"]).unwrap();
         assert!(!copy.join("target").exists());
         assert!(copy.join("src/target").is_dir(), "only top-level excludes");
+        for skipped in [".git", "node_modules", "web/node_modules", "sub/.git"] {
+            assert!(!copy.join(skipped).exists(), "{skipped} copied");
+        }
+        assert!(copy.join(".gitignore").is_file());
         assert_eq!(fs::read_to_string(copy.join("rel")).unwrap(), "a");
         assert_eq!(fs::read_link(copy.join("abs")).unwrap(), copy.join("src"));
         assert!(fs::symlink_metadata(copy.join("out")).is_err());
         assert!(fs::symlink_metadata(copy.join("src/up")).is_err());
+    }
 
-        // Snapshot + restore round trip; excluded dirs are left alone.
-        let snap = dst.path().join("s");
-        copy_tree(&copy, &snap, &["target"], false).unwrap();
-        fs::write(copy.join("src/a.txt"), "changed").unwrap();
-        fs::write(copy.join("new.txt"), "n").unwrap();
-        fs::create_dir_all(copy.join("target")).unwrap();
-        fs::write(copy.join("target/keep"), "k").unwrap();
+    #[test]
+    fn snapshot_and_restore_tracked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for (rel, text) in [
+            ("m.lock", "lock"),
+            ("sub/m.toml", "member"),
+            ("gone/m.toml", "old"),
+            ("src/a.txt", "a"),
+            ("target/m.lock", "excluded"),
+            ("node_modules/m.toml", "excluded"),
+        ] {
+            fs::create_dir_all(d.join(rel).parent().unwrap()).unwrap();
+            fs::write(d.join(rel), text).unwrap();
+        }
+        let tracked = Tracked {
+            excludes: &["target"],
+            names: &["m.lock", "m.toml"],
+        };
+        let snap = snapshot(tracked, d).unwrap();
         assert_eq!(
-            changed_files(&snap, &copy, &["target"]).unwrap(),
-            vec![PathBuf::from("new.txt"), PathBuf::from("src/a.txt")]
+            snap.keys().collect::<Vec<_>>(),
+            ["gone/m.toml", "m.lock", "sub/m.toml"].map(Path::new)
         );
-        restore(&snap, &copy, &["target"]).unwrap();
+
+        // What `apply` and a build could do.
+        fs::write(d.join("m.lock"), "new lock").unwrap();
+        fs::remove_file(d.join("gone/m.toml")).unwrap();
+        fs::create_dir_all(d.join("new")).unwrap();
+        fs::write(d.join("new/m.toml"), "added").unwrap();
+        fs::write(d.join("src/a.txt"), "built").unwrap();
+        fs::write(d.join("target/m.lock"), "changed").unwrap();
         assert_eq!(
-            changed_files(&snap, &copy, &["target"]).unwrap(),
-            Vec::<PathBuf>::new()
+            diff(&snap, &snapshot(tracked, d).unwrap()),
+            vec![
+                (PathBuf::from("gone/m.toml"), None),
+                (PathBuf::from("m.lock"), Some(b"new lock".to_vec())),
+                (PathBuf::from("new/m.toml"), Some(b"added".to_vec())),
+            ]
         );
-        assert_eq!(fs::read_to_string(copy.join("rel")).unwrap(), "a");
-        assert!(copy.join("target/keep").exists());
+
+        restore(tracked, d, &snap).unwrap();
+        assert_eq!(snapshot(tracked, d).unwrap(), snap);
+        assert!(!d.join("new/m.toml").exists());
+        // Untracked files are left alone.
+        assert_eq!(fs::read_to_string(d.join("src/a.txt")).unwrap(), "built");
+        assert_eq!(
+            fs::read_to_string(d.join("target/m.lock")).unwrap(),
+            "changed"
+        );
+
+        // Without names every file outside the excludes is tracked.
+        let all = Tracked {
+            excludes: &["target"],
+            names: &[],
+        };
+        let snap = snapshot(all, d).unwrap();
+        assert!(snap.contains_key(Path::new("src/a.txt")));
+        assert!(!snap.contains_key(Path::new("node_modules/m.toml")));
+        fs::write(d.join("src/a.txt"), "again").unwrap();
+        restore(all, d, &snap).unwrap();
+        assert_eq!(fs::read_to_string(d.join("src/a.txt")).unwrap(), "built");
+    }
+
+    #[test]
+    fn no_final_rebuild_when_reverted_change_ran_no_commands() {
+        let mut s = setup();
+        let counter = tempfile::tempdir().unwrap();
+        let count = counter.path().join("builds");
+        s.commands.build = Some(format!("echo . >> '{}'", count.display()));
+        s.fake.no_effect.push("q".into()); // q fails before any command
+        let r = run(&s);
+        assert_eq!(
+            r.labels(),
+            labels(&[("p", "fixed"), ("q", "failed:still_vulnerable")])
+        );
+        // Baseline and p only.
+        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
     }
 }
