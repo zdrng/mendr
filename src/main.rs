@@ -86,11 +86,16 @@ enum Format {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(&cli) {
-        Ok(code) => ExitCode::from(code),
-        Err(e) => {
+    verify::install_signal_handlers();
+    match verify::catch_interrupt(|| run(&cli)) {
+        Ok(Ok(code)) => ExitCode::from(code),
+        Ok(Err(e)) => {
             progress::error(format!("{e:#}"));
             ExitCode::from(2)
+        }
+        Err(interrupted) => {
+            progress::error("interrupted");
+            ExitCode::from(interrupted.exit_code())
         }
     }
 }
@@ -138,7 +143,10 @@ fn run(cli: &Cli) -> Result<u8> {
     let mut projects = Vec::new();
     for project in &config.projects {
         let mut pr = ProjectReport::new(&project.path, &config.base_dir);
-        if let Err(e) = run_project(cli, &config, project, &mut osv, now, &mut pr) {
+        let result = run_project(cli, &config, project, &mut osv, now, &mut pr);
+        // A signal during write-back takes effect here.
+        verify::check_interrupted();
+        if let Err(e) = result {
             progress::error(format!("project {}: {e:#}", pr.path));
             pr.error = Some(format!("{e:#}"));
         }
