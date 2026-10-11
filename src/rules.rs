@@ -130,6 +130,7 @@ mod tests {
             summary: None,
             severity: None,
             records: vec![],
+            package: None,
         };
         let rules = vec![
             IgnoreRule {

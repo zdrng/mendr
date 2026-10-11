@@ -366,7 +366,11 @@ fn range_affects(range: &OsvRange, eco: &dyn Ecosystem, version: &Version) -> bo
 
 // ---- Advisories (deduped) ------------------------------------------------------
 
-/// One logical vulnerability: OSV records that alias each other, merged.
+/// One logical vulnerability of one package: OSV records that alias each
+/// other and affect that package, merged. Records are merged per package
+/// only, so one CVE in two packages gives two advisories, each with the ids,
+/// summary and severity of its own package's records (and an ignore rule for
+/// one package's id does not silence the other).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Advisory {
     /// Primary id: the smallest non-`CVE-` record id in the group (sorted
@@ -378,18 +382,30 @@ pub struct Advisory {
     /// Highest severity among the group's records.
     pub severity: Option<Severity>,
     pub records: Vec<OsvRecord>,
+    /// The package (ecosystem without `:suffix`); `None` for records that
+    /// name no package.
+    pub package: Option<OsvPackage>,
 }
 
 impl Advisory {
+    /// Whether this is the advisory of `package` in `eco`.
+    fn is_for(&self, eco: &dyn Ecosystem, package: &str) -> bool {
+        self.package
+            .as_ref()
+            .is_some_and(|p| p.name == package && ecosystem_matches(&p.ecosystem, eco))
+    }
+
     /// Affected if any record of the group says so.
     pub fn affects(&self, eco: &dyn Ecosystem, package: &str, version: &Version) -> bool {
-        self.records
-            .iter()
-            .any(|r| is_affected(r, eco, package, version))
+        self.is_for(eco, package)
+            && self
+                .records
+                .iter()
+                .any(|r| is_affected(r, eco, package, version))
     }
 
     pub fn mentions(&self, eco: &dyn Ecosystem, package: &str) -> bool {
-        self.records.iter().any(|r| mentions(r, eco, package))
+        self.is_for(eco, package)
     }
 
     /// Whether `id` is the primary id or one of the aliases.
@@ -413,11 +429,56 @@ pub fn is_relevant(record: &OsvRecord) -> bool {
     record.withdrawn.is_none() && !is_informational(record)
 }
 
-/// Drop irrelevant records and merge records that share an id/alias.
-/// Output is sorted by primary id.
+/// Drop irrelevant records and merge, per affected package, records that
+/// share an id/alias (a record naming several packages joins each of their
+/// groups). Output is sorted by primary id, then package.
 pub fn dedupe(records: Vec<OsvRecord>) -> Vec<Advisory> {
-    let mut groups: Vec<(BTreeSet<String>, Vec<OsvRecord>)> = Vec::new();
+    // (ecosystem, name) -> records; `None` for records without packages.
+    let mut by_package: BTreeMap<Option<(String, String)>, Vec<OsvRecord>> = BTreeMap::new();
     for record in records.into_iter().filter(is_relevant) {
+        let keys: BTreeSet<(String, String)> = record
+            .affected
+            .iter()
+            .filter_map(|a| a.package.as_ref())
+            .map(|p| {
+                let eco = p.ecosystem.split(':').next().unwrap_or_default();
+                (eco.to_string(), p.name.clone())
+            })
+            .collect();
+        if keys.is_empty() {
+            by_package.entry(None).or_default().push(record);
+        } else {
+            for key in keys {
+                by_package
+                    .entry(Some(key))
+                    .or_default()
+                    .push(record.clone());
+            }
+        }
+    }
+    let mut out: Vec<Advisory> = by_package
+        .into_iter()
+        .flat_map(|(key, records)| {
+            let package = key.map(|(ecosystem, name)| OsvPackage { ecosystem, name });
+            merge_aliases(records)
+                .into_iter()
+                .map(move |(ids, records)| advisory(ids, records, package.clone()))
+        })
+        .collect();
+    let package_key = |a: &Advisory| {
+        a.package
+            .as_ref()
+            .map(|p| (p.name.clone(), p.ecosystem.clone()))
+    };
+    out.sort_by(|a, b| (&a.id, package_key(a)).cmp(&(&b.id, package_key(b))));
+    out
+}
+
+/// Groups of records that share an id/alias (transitively), with all their
+/// ids.
+fn merge_aliases(records: Vec<OsvRecord>) -> Vec<(BTreeSet<String>, Vec<OsvRecord>)> {
+    let mut groups: Vec<(BTreeSet<String>, Vec<OsvRecord>)> = Vec::new();
+    for record in records {
         let mut ids: BTreeSet<String> = record.aliases.iter().cloned().collect();
         ids.insert(record.id.clone());
         let mut merged = (ids, vec![record]);
@@ -434,39 +495,42 @@ pub fn dedupe(records: Vec<OsvRecord>) -> Vec<Advisory> {
         }
         groups.push(merged);
     }
-    let mut out: Vec<Advisory> = groups
-        .into_iter()
-        .map(|(ids, mut records)| {
-            records.sort_by(|a, b| a.id.cmp(&b.id));
-            records.dedup_by(|a, b| a.id == b.id);
-            let primary = records
-                .iter()
-                .map(|r| r.id.as_str())
-                .min_by_key(|id| (id.starts_with("CVE-"), *id))
-                .expect("group is non-empty")
-                .to_string();
-            let aliases = ids.into_iter().filter(|i| *i != primary).collect();
-            let summary = records
-                .iter()
-                .find(|r| r.id == primary)
-                .and_then(|r| r.summary.clone())
-                .or_else(|| records.iter().find_map(|r| r.summary.clone()));
-            let severity = records.iter().filter_map(record_severity).max_by(|a, b| {
-                (a.level, a.score.unwrap_or(0.0))
-                    .partial_cmp(&(b.level, b.score.unwrap_or(0.0)))
-                    .unwrap_or(Ordering::Equal)
-            });
-            Advisory {
-                id: primary,
-                aliases,
-                summary,
-                severity,
-                records,
-            }
-        })
-        .collect();
-    out.sort_by(|a, b| a.id.cmp(&b.id));
-    out
+    groups
+}
+
+/// One merged group as an advisory.
+fn advisory(
+    ids: BTreeSet<String>,
+    mut records: Vec<OsvRecord>,
+    package: Option<OsvPackage>,
+) -> Advisory {
+    records.sort_by(|a, b| a.id.cmp(&b.id));
+    records.dedup_by(|a, b| a.id == b.id);
+    let primary = records
+        .iter()
+        .map(|r| r.id.as_str())
+        .min_by_key(|id| (id.starts_with("CVE-"), *id))
+        .expect("group is non-empty")
+        .to_string();
+    let aliases = ids.into_iter().filter(|i| *i != primary).collect();
+    let summary = records
+        .iter()
+        .find(|r| r.id == primary)
+        .and_then(|r| r.summary.clone())
+        .or_else(|| records.iter().find_map(|r| r.summary.clone()));
+    let severity = records.iter().filter_map(record_severity).max_by(|a, b| {
+        (a.level, a.score.unwrap_or(0.0))
+            .partial_cmp(&(b.level, b.score.unwrap_or(0.0)))
+            .unwrap_or(Ordering::Equal)
+    });
+    Advisory {
+        id: primary,
+        aliases,
+        summary,
+        severity,
+        records,
+        package,
+    }
 }
 
 /// A graph node affected by at least one advisory.
@@ -601,9 +665,9 @@ impl Osv {
         }
     }
 
-    /// All relevant, deduped advisories mentioning any of `packages` in
-    /// `eco` (for every version, not only the installed ones: the planner
-    /// needs them to pick safe targets).
+    /// All relevant, deduped advisories of `packages` in `eco` (for every
+    /// version, not only the installed ones: the planner needs them to pick
+    /// safe targets). One advisory id may appear once per package.
     pub fn advisories(
         &mut self,
         eco: &dyn Ecosystem,
@@ -653,7 +717,15 @@ impl Osv {
                     .collect()
             }
         };
-        Ok(dedupe(records))
+        // Records may also name packages outside the scan (or ecosystem).
+        let wanted: BTreeSet<&str> = packages.iter().map(String::as_str).collect();
+        let mut advisories = dedupe(records);
+        advisories.retain(|a| {
+            a.package
+                .as_ref()
+                .is_some_and(|p| wanted.contains(p.name.as_str()) && a.is_for(eco, &p.name))
+        });
+        Ok(advisories)
     }
 }
 
@@ -919,6 +991,91 @@ mod tests {
         let out = dedupe(vec![a, b, c]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "A");
+    }
+
+    #[test]
+    fn dedupe_keeps_packages_apart() {
+        let eco = Fake::new();
+        let events = serde_json::json!([{"introduced": "0"}]);
+        let mut x = ranged("RUSTSEC-X", "x", events.clone());
+        x.aliases = vec!["CVE-1".into()];
+        x.summary = Some("x is bad".into());
+        let mut y = ranged("RUSTSEC-Y", "y", events.clone());
+        y.aliases = vec!["CVE-1".into()];
+        y.summary = Some("y is bad".into());
+        y.database_specific = Some(serde_json::json!({"severity": "LOW"}));
+        // One record for both packages joins both groups.
+        let mut both = ranged("GHSA-both", "x", events.clone());
+        both.affected.push(both.affected[0].clone());
+        both.affected[1].package.as_mut().unwrap().name = "y".into();
+        both.aliases = vec!["CVE-2".into()];
+
+        let out = dedupe(vec![x, y, both]);
+        let summary: Vec<(&str, &str, Vec<&str>)> = out
+            .iter()
+            .map(|a| {
+                (
+                    a.id.as_str(),
+                    a.package.as_ref().unwrap().name.as_str(),
+                    a.aliases.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("GHSA-both", "x", vec!["CVE-2"]),
+                ("GHSA-both", "y", vec!["CVE-2"]),
+                ("RUSTSEC-X", "x", vec!["CVE-1"]),
+                ("RUSTSEC-Y", "y", vec!["CVE-1"]),
+            ]
+        );
+        let (adv_x, adv_y) = (&out[2], &out[3]);
+        assert_eq!(adv_x.summary.as_deref(), Some("x is bad"));
+        assert_eq!(adv_y.summary.as_deref(), Some("y is bad"));
+        assert_eq!(adv_x.severity, None);
+        assert_eq!(adv_y.severity.unwrap().level, SeverityLevel::Low);
+        assert!(adv_x.affects(&eco, "x", &v("1.0.0")));
+        assert!(!adv_x.affects(&eco, "y", &v("1.0.0")));
+        assert!(!out[0].affects(&eco, "y", &v("1.0.0")), "x's copy");
+        assert!(out[1].affects(&eco, "y", &v("1.0.0")));
+        assert!(!adv_x.mentions(&eco, "y"));
+        assert!(!adv_x.has_id("RUSTSEC-Y"));
+
+        // An ignore for y's id leaves x alone.
+        let rules = [crate::config::IgnoreRule {
+            id: "RUSTSEC-Y".into(),
+            reason: "not reachable".into(),
+            expires: None,
+        }];
+        let today = jiff::civil::date(2026, 1, 1);
+        use crate::rules::{IgnoreMatch, ignore_match};
+        assert_eq!(ignore_match(adv_x, &rules, today), IgnoreMatch::None);
+        assert_eq!(
+            ignore_match(adv_y, &rules, today),
+            IgnoreMatch::Active(&rules[0])
+        );
+
+        // Each vulnerable node gets its own package's advisories only.
+        let mut g = DepGraph::new();
+        let root = g.add_root("app", &v("0.1.0"));
+        let nx = g.add_node("x", &v("1.0.0"), true, true);
+        let ny = g.add_node("y", &v("1.0.0"), true, true);
+        g.add_edge(root, nx, crate::model::VersionReq::new("^1"));
+        g.add_edge(root, ny, crate::model::VersionReq::new("^1"));
+        assert_eq!(
+            vulnerabilities_for(&g, &eco, &out),
+            vec![
+                VulnerableNode {
+                    node: nx,
+                    advisories: vec![0, 2]
+                },
+                VulnerableNode {
+                    node: ny,
+                    advisories: vec![1, 3]
+                },
+            ]
+        );
     }
 
     #[test]
