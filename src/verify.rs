@@ -8,7 +8,9 @@
 //! 2. Baseline: run `commands.install`, `build`, `test` (`sh -c`, cwd = copy,
 //!    `project.timeout` per command, each in its own process group that is
 //!    killed when the command ends, so background processes do not survive
-//!    it; see [`install_signal_handlers`] for Ctrl-C). If anything fails,
+//!    it; see [`install_signal_handlers`] for Ctrl-C; with `--sandbox` each
+//!    command runs in its own container instead, see [`crate::sandbox`],
+//!    which is checked before the copy is made). If anything fails,
 //!    every finding that has a change becomes `Failed { BaselineFailed }`
 //!    and nothing else runs.
 //!    Then resolve the graph and scan it (the "current" state).
@@ -65,6 +67,7 @@ use crate::osv::{self, Advisory, Osv};
 use crate::plan::{Finding, ProjectPlan};
 use crate::progress;
 use crate::rules::{self, IgnoreMatch};
+use crate::sandbox::{self, Sandbox};
 
 /// Everything `verify` needs for one project.
 pub struct VerifyContext<'a> {
@@ -74,6 +77,8 @@ pub struct VerifyContext<'a> {
     pub commands: Commands,
     /// Per-command timeout (`project.timeout`).
     pub timeout: Option<Duration>,
+    /// Run install/build/test in containers (`--sandbox`).
+    pub sandbox: Option<&'a Sandbox>,
     pub policy: &'a Policy,
     pub ignores: &'a [IgnoreRule],
     pub now: Timestamp,
@@ -98,6 +103,11 @@ pub struct Verified {
 pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Result<Verified> {
     // A signal now unwinds at the next check, which removes the temp dir.
     let _defer = defer_signals();
+    if let Some(sandbox) = ctx.sandbox {
+        let step = progress::begin("Preparing", format!("sandbox ({})", sandbox.describe()));
+        sandbox.check().context("preparing the sandbox")?;
+        step.done("Sandbox", format!("{} ready", sandbox.describe()));
+    }
     let excludes = ctx.eco.copy_excludes();
     let root = ctx
         .project
@@ -585,7 +595,7 @@ fn run_steps(ctx: &VerifyContext, dir: &Path, baseline: bool) -> Result<(), Fail
     for (step, command) in steps {
         let Some(command) = command else { continue };
         let command = command.clone();
-        let (exit_code, log_tail) = match run_shell(dir, &command, ctx.timeout) {
+        let (exit_code, log_tail) = match run_shell(dir, &command, ctx.timeout, ctx.sandbox) {
             Run::Ok => continue,
             Run::Failed {
                 exit_code,
@@ -640,7 +650,14 @@ fn run_steps(ctx: &VerifyContext, dir: &Path, baseline: bool) -> Result<(), Fail
 /// or mendr is interrupted, the whole group is killed, so nothing it
 /// started in the background keeps running in the copy. A zero timeout
 /// counts as none. On an interrupt this unwinds (see [`check_interrupted`]).
-fn run_shell(dir: &Path, command: &str, timeout: Option<Duration>) -> Run {
+/// With a `sandbox`, the process is the engine CLI running the command in
+/// a new container, which is removed if the CLI had to be killed.
+fn run_shell(
+    dir: &Path,
+    command: &str,
+    timeout: Option<Duration>,
+    sandbox: Option<&Sandbox>,
+) -> Run {
     use std::os::unix::process::CommandExt;
 
     check_interrupted();
@@ -659,9 +676,16 @@ fn run_shell(dir: &Path, command: &str, timeout: Option<Duration>) -> Run {
         (Ok(o), Ok(e)) => (o, e),
         (Err(e), _) | (_, Err(e)) => return failed(e),
     };
-    let child = Command::new("sh")
-        .arg("-c")
-        .arg(command)
+    let container = sandbox.map(|s| (s, sandbox::container_name()));
+    let mut cmd = match &container {
+        Some((s, name)) => s.command(dir, command, name),
+        None => {
+            let mut sh = Command::new("sh");
+            sh.arg("-c").arg(command);
+            sh
+        }
+    };
+    let child = cmd
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(out)
@@ -678,6 +702,9 @@ fn run_shell(dir: &Path, command: &str, timeout: Option<Duration>) -> Run {
     let status = wait_for(&mut child, timeout, &SIGNAL);
     kill_group(group);
     CHILD_GROUP.store(0, Ordering::SeqCst);
+    if let (Some((s, name)), Ok(None) | Err(_)) = (&container, &status) {
+        s.kill(name);
+    }
     check_interrupted();
     let tail = read_tail(&mut log);
     match status {
@@ -1133,6 +1160,7 @@ mod tests {
             project,
             commands: s.commands.clone(),
             timeout: s.timeout,
+            sandbox: None,
             policy: &s.policy,
             ignores: &s.ignores,
             now: now(),
@@ -1636,7 +1664,12 @@ mod tests {
     #[test]
     fn background_processes_do_not_outlive_the_command() {
         let dir = tempfile::tempdir().unwrap();
-        let run = run_shell(dir.path(), "sleep 30 & echo $! > bg.pid; exit 0", None);
+        let run = run_shell(
+            dir.path(),
+            "sleep 30 & echo $! > bg.pid; exit 0",
+            None,
+            None,
+        );
         assert!(matches!(run, Run::Ok));
         let pid = read_pid(&dir.path().join("bg.pid"));
         assert!(!still_alive(pid), "background process {pid} survived");
@@ -1645,7 +1678,7 @@ mod tests {
     #[test]
     fn zero_timeout_is_no_timeout() {
         let dir = tempfile::tempdir().unwrap();
-        let run = run_shell(dir.path(), "sleep 0.1", Some(Duration::ZERO));
+        let run = run_shell(dir.path(), "sleep 0.1", Some(Duration::ZERO), None);
         assert!(matches!(run, Run::Ok));
     }
 
@@ -1759,7 +1792,7 @@ mod tests {
                 "(trap '' TERM; sleep 30) & echo $! > '{p}.tmp'; mv '{p}.tmp' '{p}'; wait",
                 p = pid.display()
             );
-            run_shell(work.path(), &command, None);
+            run_shell(work.path(), &command, None, None);
         });
         std::process::exit(result.err().map_or(0, |i| i.exit_code().into()));
     }

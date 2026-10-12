@@ -84,6 +84,7 @@ the elapsed time and the current request or command:
 | `--osv-snapshot <DIR>` | read OSV records from `DIR/*.json` (one record per file, osv.dev schema) instead of the live API |
 | `--allow-major` | allow major version bumps (`[policy] allow-major`) |
 | `--allow-unsandboxed` | run builds even when the safety checks fail (`[safety] allow-unsandboxed`) |
+| `--sandbox` | run install/build/test in throwaway Docker/Podman containers (needs `[sandbox]`, see [Sandbox](#sandbox)) |
 | `--min-release-age <DUR>` | minimum age of any version mendr picks: `"7d"`, `"12h"`, `"20m"`, `"30s"`, `"0"` = off (`[policy] min-release-age`, default `7d`) |
 | `-q`, `--quiet` | print only warnings and errors on stderr |
 | `--write` | copy verified manifest/lockfile changes back into the project (not with `--plan-only`) |
@@ -104,6 +105,10 @@ target = "minimal"           # or "latest-compatible": highest fixed version wit
 [safety]
 allow-unsandboxed = false
 deny-paths = ["~/.aws", "/etc/secrets"]   # extra paths that must not be readable (`~/` = HOME)
+
+[sandbox]                    # only used with --sandbox; no defaults, both keys required
+engine = "docker"            # docker | podman
+image = "docker.io/library/rust:1"        # must contain the project's toolchain
 
 [[project]]                  # repeatable; default: one project at "."
 path = "services/api"        # ecosystem auto-detected
@@ -161,9 +166,9 @@ build that project (it reports a project error, exit 2) if it finds any:
   `.yarnrc.yml` with `npmAuth`, and `.env` / `.env.*` files (not `.example`, `.sample`,
   `.template`).
 
-Run mendr where none of this is reachable (a container or CI job without secrets), use
-`--plan-only`, or accept the risk with `--allow-unsandboxed` (mendr then prints the list as a
-warning). The checks look for danger; they cannot prove isolation.
+Run mendr with `--sandbox` (below), run it where none of this is reachable (a container or CI job
+without secrets), use `--plan-only`, or accept the risk with `--allow-unsandboxed` (mendr then
+prints the list as a warning). The checks look for danger; they cannot prove isolation.
 
 The temp copy leaves out `.git` and every `node_modules`. Commands run in their own process
 group, which is killed when the command ends (no background process survives it). On Ctrl-C,
@@ -171,6 +176,39 @@ group, which is killed when the command ends (no background process survives it)
 128 + the signal number (130, 143, 129); a second signal exits at once. `--write` refuses to
 touch the project if a file it would write changed since mendr copied it, and replaces files by
 renaming temp files written next to them.
+
+### Sandbox
+
+With `--sandbox`, mendr runs every install, build and test command in a new container
+(`docker run --rm` / `podman run --rm`) of the `[sandbox]` image, so you do not have to set up an
+isolated environment yourself. The flag needs a `[sandbox]` section; there are no defaults:
+
+```toml
+[sandbox]
+engine = "podman"                          # docker | podman
+image = "docker.io/library/rust:1-slim"    # e.g. docker.io/library/node:22-slim for npm
+```
+
+- The container sees only the project's temp copy and a temp `HOME` for tool caches (npm, pnpm,
+  and the Cargo registry), both at the same paths as on the host, and removed after the project.
+  No environment variables, files or sockets of the host get in; it runs as your user (Podman:
+  `--userns=keep-id`, so rootless Podman) with all capabilities dropped. The network stays on:
+  installs need the registries.
+- Scanning, planning, resolving the lockfile and `--write` still run on the host (they run no
+  project or dependency code), so the host still needs the package manager. The image's
+  toolchain should be at least as new as the host's (e.g. a newer host Cargo may write a
+  lockfile version an old image cannot read; the baseline then fails with the log).
+- The host checks above are skipped; the project checks (`.npmrc` tokens, `.env` files) still
+  run, because those files are copied into the container.
+- The temp dir must be visible inside the container. On macOS the engine runs in a VM that
+  shares only some host directories: the default `TMPDIR` (`/var/folders/...`) works with Docker
+  Desktop and Podman machines; with Colima, or inside `nix develop` (which sets `TMPDIR` to
+  `/tmp/nix-shell.*`), set `TMPDIR` to a shared directory. mendr checks this (and that the
+  engine runs and the image can be pulled) before the first command and explains a failure.
+- One config has one image: for a repository that mixes ecosystems use an image with all their
+  toolchains, or run mendr once per ecosystem with separate config files.
+- On a timeout or Ctrl-C mendr removes the running container. Its containers are labelled
+  `mendr` (`docker ps -a --filter label=mendr`).
 
 ## Output and exit codes
 

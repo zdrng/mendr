@@ -231,6 +231,15 @@ pub trait Ecosystem {
         &[]
     }
 
+    /// Environment for commands run in a `--sandbox` container: variable
+    /// name and a path relative to the container's `HOME`, which lives as
+    /// long as one project's verification. For tools whose caches would
+    /// otherwise land in the image and be lost after every command. Empty
+    /// (the default) when the caches already live under `HOME`.
+    fn sandbox_env(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
     // ---- Registry --------------------------------------------------------------
 
     /// All published versions of `package` (any order, including yanked).

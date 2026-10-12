@@ -13,6 +13,10 @@
 //! deny-paths = ["~/.aws"]       # extra paths that must not be readable
 //!                               # (`~/` = HOME, relative = config file dir)
 //!
+//! [sandbox]                     # used only with --sandbox; both keys required
+//! engine = "docker"             # docker | podman
+//! image = "docker.io/library/rust:1"
+//!
 //! [[project]]                   # repeatable; default: one project at "."
 //! path = "apps/web"             # relative to the config file
 //! ecosystem = "npm"             # optional, auto-detected
@@ -133,6 +137,34 @@ pub struct SafetyConfig {
     pub deny_paths: Vec<String>,
 }
 
+/// Container engine for `--sandbox`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Engine {
+    Docker,
+    Podman,
+}
+
+impl Engine {
+    /// The CLI program.
+    pub fn program(self) -> &'static str {
+        match self {
+            Engine::Docker => "docker",
+            Engine::Podman => "podman",
+        }
+    }
+}
+
+/// `[sandbox]`: run install/build/test in a container. No defaults: the
+/// section needs both keys, and only `--sandbox` turns it on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SandboxConfig {
+    pub engine: Engine,
+    pub image: String,
+    /// Set by `--sandbox`; never by the file.
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     /// Directory the config file lives in (or the cwd without a file).
@@ -141,6 +173,8 @@ pub struct Config {
     pub file: Option<PathBuf>,
     pub policy: Policy,
     pub safety: SafetyConfig,
+    /// `[sandbox]`, if the file has one.
+    pub sandbox: Option<SandboxConfig>,
     pub projects: Vec<ProjectConfig>,
     pub ignores: Vec<IgnoreRule>,
 }
@@ -151,6 +185,7 @@ pub struct Overrides {
     pub allow_major: bool,
     pub allow_unsandboxed: bool,
     pub min_release_age: Option<String>,
+    pub sandbox: bool,
 }
 
 #[derive(Deserialize)]
@@ -160,6 +195,7 @@ struct RawConfig {
     policy: RawPolicy,
     #[serde(default)]
     safety: RawSafety,
+    sandbox: Option<RawSandbox>,
     #[serde(default)]
     project: Vec<RawProject>,
     #[serde(default)]
@@ -183,6 +219,13 @@ struct RawSafety {
     allow_unsandboxed: bool,
     #[serde(default)]
     deny_paths: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct RawSandbox {
+    engine: Engine,
+    image: String,
 }
 
 #[derive(Deserialize)]
@@ -268,6 +311,7 @@ impl Config {
             file: None,
             policy: Policy::default(),
             safety: SafetyConfig::default(),
+            sandbox: None,
             projects: vec![ProjectConfig::at(base_dir.to_path_buf())],
             ignores: Vec::new(),
         }
@@ -339,6 +383,11 @@ impl Config {
                     .map(|p| resolve_deny_path(p, base_dir))
                     .collect(),
             },
+            sandbox: raw.sandbox.map(|s| SandboxConfig {
+                engine: s.engine,
+                image: s.image,
+                enabled: false,
+            }),
             projects,
             ignores,
         })
@@ -386,6 +435,17 @@ impl Config {
         if let Some(age) = &o.min_release_age {
             self.policy.min_release_age = parse_duration(age).context("--min-release-age")?;
         }
+        if o.sandbox {
+            let Some(sandbox) = &mut self.sandbox else {
+                bail!(
+                    "--sandbox needs a [sandbox] section with `engine` and `image` in {}",
+                    self.file
+                        .as_deref()
+                        .map_or(CONFIG_FILE.into(), |f| f.display().to_string())
+                );
+            };
+            sandbox.enabled = true;
+        }
         Ok(())
     }
 
@@ -399,6 +459,11 @@ impl Config {
             if self.policy.strategies[..i].contains(s) {
                 bail!("policy.strategies lists `{s}` twice");
             }
+        }
+        if let Some(s) = &self.sandbox
+            && s.image.trim().is_empty()
+        {
+            bail!("sandbox.image must not be empty");
         }
         for p in &self.projects {
             if let Some(e) = &p.ecosystem
@@ -517,6 +582,7 @@ expires = "2027-01-02"
             allow_major: true,
             allow_unsandboxed: true,
             min_release_age: Some("0".into()),
+            sandbox: false,
         })
         .unwrap();
         assert!(c.policy.allow_major);
@@ -529,6 +595,49 @@ expires = "2027-01-02"
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn sandbox_needs_both_keys_and_the_flag() {
+        let text = "[sandbox]\nengine = \"podman\"\nimage = \"docker.io/library/rust:1\"\n";
+        let mut c = Config::parse(text, Path::new("/r")).unwrap();
+        let s = c.sandbox.clone().unwrap();
+        assert_eq!(s.engine, Engine::Podman);
+        assert_eq!(s.image, "docker.io/library/rust:1");
+        assert!(!s.enabled, "only --sandbox turns it on");
+        c.apply_overrides(&Overrides {
+            sandbox: true,
+            ..Overrides::default()
+        })
+        .unwrap();
+        assert!(c.sandbox.unwrap().enabled);
+
+        for bad in [
+            "[sandbox]\nengine = \"docker\"\n",
+            "[sandbox]\nimage = \"x\"\n",
+            "[sandbox]\nengine = \"lxc\"\nimage = \"x\"\n",
+            "[sandbox]\nengine = \"docker\"\nimage = \"x\"\nnetwork = \"none\"\n",
+        ] {
+            assert!(Config::parse(bad, Path::new("/r")).is_err(), "{bad}");
+        }
+        let c = Config::parse(
+            "[sandbox]\nengine = \"docker\"\nimage = \" \"\n",
+            Path::new("/r"),
+        )
+        .unwrap();
+        assert!(c.validate(&[]).is_err());
+    }
+
+    #[test]
+    fn sandbox_flag_without_section_fails() {
+        let mut c = Config::default_at(Path::new("/r"));
+        let err = c
+            .apply_overrides(&Overrides {
+                sandbox: true,
+                ..Overrides::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("[sandbox] section"), "{err}");
     }
 
     #[test]

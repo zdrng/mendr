@@ -22,8 +22,9 @@ and every attempt ends in a structured result with a reason.
 2. For each project: detect the ecosystem, resolve the dependency graph, look up vulnerabilities in OSV.
 3. Plan: for each vulnerable package, pick the cheapest strategy the rules allow:
    `relock` → `direct bump` → `override` → give up with a reason.
-4. Unless `--plan-only` or nothing is planned: run the safety checks (host and project), copy the
-   project, run a baseline build/test, then apply each change, build, test, and keep or revert it.
+4. Unless `--plan-only` or nothing is planned: run the safety checks (host and project; with
+   `--sandbox` only project), copy the project, run a baseline build/test, then apply each change,
+   build, test, and keep or revert it.
 5. Print the report (JSON or Markdown).
 
 ## Module layout
@@ -36,6 +37,7 @@ src/
   osv.rs             OSV client, cache, snapshot loading, range matching, alias dedupe
   rules.rs           release age, major bumps, severity, ignore list (plain fns)
   safety.rs          secret and escape-route checks
+  sandbox.rs         --sandbox: install/build/test in Docker/Podman containers
   plan.rs            fix planning (ecosystem-agnostic)
   verify.rs          temp copy, baseline, apply, build, test, revert
   report.rs          JSON + Markdown output
@@ -66,6 +68,10 @@ target = "minimal"           # or "latest-compatible"
 allow-unsandboxed = false
 deny-paths = ["~/.aws"]
 
+[sandbox]                    # only with --sandbox; both keys required, no defaults
+engine = "podman"            # docker | podman
+image = "docker.io/library/rust:1-slim"
+
 [[project]]
 path = "apps/web"            # ecosystem auto-detected
 test = "npm test"
@@ -83,8 +89,8 @@ reason = "not reachable"
 expires = 2026-12-31
 ```
 
-CLI overrides: `--allow-major`, `--allow-unsandboxed`, `--min-release-age <dur>`, `--plan-only`,
-`--format json|markdown`, `--osv-snapshot <dir>`, `--output <file>`, `--write`, `--config <path>`.
+CLI overrides: `--allow-major`, `--allow-unsandboxed`, `--sandbox`, `--min-release-age <dur>`,
+`--plan-only`, `--format json|markdown`, `--osv-snapshot <dir>`, `--output <file>`, `--write`, `--config <path>`.
 Without a config file mendr uses the defaults and one auto-detected project in the current
 directory. Full reference: the doc comment at the top of `src/config.rs`.
 
@@ -195,6 +201,16 @@ tags: `{"kind": "skipped", "reason": {"kind": "no_parent_version_fixes", ...}}`.
 - Commands run as `sh -c` in the copy with mendr's environment, stdin `/dev/null`, stdout+stderr
   combined into the log tail. A timeout kills the command's whole process group. A baseline
   timeout is reported as `baseline_failed` (`exit_code: null`, log tail says "timed out").
+- `--sandbox` (`sandbox.rs`) changes only how `run_shell` starts a command: `docker|podman run
+  --rm --init` per command (the container stops with `sh`, so background processes die like the
+  process group does without it), mounting only the copy and a per-project temp `HOME` at their
+  host paths, no host env, own user (`--user uid:gid` / `--userns=keep-id`), `--cap-drop=ALL`,
+  `no-new-privileges`. Caches outlive single commands through that `HOME`;
+  `Ecosystem::sandbox_env` points tools whose image keeps them elsewhere (Cargo: `CARGO_HOME`)
+  into it. On timeout/interrupt the container is removed (`rm --force`), since killing the CLI
+  does not stop it. `Sandbox::check` runs before the copy: engine running, image pullable, temp
+  dir visible in the container (macOS VMs share only some dirs). Resolving and `apply` stay on
+  the host: they run no project code. With `--sandbox` only the project safety checks run.
 - Safety checks look for danger, not isolation: credential files under `HOME` and named by env
   vars (`CARGO_HOME`, `DOCKER_CONFIG`, `KUBECONFIG`, ...), secret-looking env var names
   (values never printed), a reachable SSH agent, a reachable Docker/Podman socket or a
@@ -348,5 +364,5 @@ Constraints to keep in mind:
 - [ ] Flutter/Dart adapter
 - [ ] yarn support
 - [ ] SARIF output
-- [ ] `--sandbox=docker|podman` self-launch
+- [x] `--sandbox`: install/build/test in Docker/Podman containers (`[sandbox] engine`, `image`)
 - [ ] Scheduled CI job: fixtures against live OSV to catch advisory drift

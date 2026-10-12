@@ -25,6 +25,10 @@
 //!   the temp copy): an `.npmrc`/`.yarnrc.yml` with a registry token and
 //!   `.env` / `.env.*` files.
 //!
+//! With `--sandbox` builds run in a container that sees none of the host
+//! ([`crate::sandbox`]), so only the project checks run
+//! ([`enforce_project`]).
+//!
 //! Fixture tests run mendr with `HOME` set to an empty temp dir and a
 //! cleared environment, so the checks pass there without the flag.
 
@@ -254,10 +258,26 @@ pub fn enforce(config: &SafetyConfig, project: &Path) -> Result<()> {
     let env = Environment::current();
     let mut violations = check_with(config, &env);
     violations.extend(check_project(project, &env));
-    decide(config, &violations)
+    decide(
+        config,
+        &violations,
+        "Run mendr with --sandbox (see [sandbox] in mendr.toml) or in a sandbox/container \
+         without them, use --plan-only, or pass --allow-unsandboxed to run anyway.",
+    )
 }
 
-fn decide(config: &SafetyConfig, violations: &[Violation]) -> Result<()> {
+/// [`enforce`] for `--sandbox` runs: only [`check_project`], since its
+/// files are copied into the container.
+pub fn enforce_project(config: &SafetyConfig, project: &Path) -> Result<()> {
+    decide(
+        config,
+        &check_project(project, &Environment::current()),
+        "They are copied into the sandbox: remove them from the project, use --plan-only, \
+         or pass --allow-unsandboxed to run anyway.",
+    )
+}
+
+fn decide(config: &SafetyConfig, violations: &[Violation], hint: &str) -> Result<()> {
     if violations.is_empty() {
         return Ok(());
     }
@@ -273,9 +293,7 @@ fn decide(config: &SafetyConfig, violations: &[Violation]) -> Result<()> {
         return Ok(());
     }
     bail!(
-        "refusing to run builds: dependency build scripts and tests could read these secrets\n{}\n\
-         Run mendr in a sandbox/container without them, use --plan-only, or pass \
-         --allow-unsandboxed to run anyway.",
+        "refusing to run builds: dependency build scripts and tests could read these secrets\n{}\n{hint}",
         list.join("\n")
     )
 }
@@ -1173,14 +1191,16 @@ mod tests {
             "environment variable X_TOKEN looks like a secret".into(),
         )];
         let mut config = SafetyConfig::default();
-        assert!(decide(&config, &[]).is_ok());
-        let err = decide(&config, &v).unwrap_err().to_string();
+        assert!(decide(&config, &[], "hint").is_ok());
+        let err = decide(&config, &v, "Pass --allow-unsandboxed.")
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("[secret-env] environment variable X_TOKEN"),
             "{err}"
         );
         assert!(err.contains("--allow-unsandboxed"), "{err}");
         config.allow_unsandboxed = true;
-        assert!(decide(&config, &v).is_ok());
+        assert!(decide(&config, &v, "hint").is_ok());
     }
 }

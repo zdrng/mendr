@@ -12,6 +12,7 @@ mod progress;
 mod report;
 mod rules;
 mod safety;
+mod sandbox;
 mod verify;
 
 use std::collections::BTreeSet;
@@ -65,6 +66,11 @@ struct Cli {
     #[arg(long)]
     allow_unsandboxed: bool,
 
+    /// Run install/build/test in throwaway containers that see only the
+    /// project copy (needs a [sandbox] section in mendr.toml).
+    #[arg(long)]
+    sandbox: bool,
+
     /// Minimum age of any version mendr picks, e.g. "7d", "12h", "0" (off).
     /// Default: [policy] min-release-age, else 7d.
     #[arg(long, value_name = "DUR")]
@@ -111,6 +117,7 @@ fn run(cli: &Cli) -> Result<u8> {
         allow_major: cli.allow_major,
         allow_unsandboxed: cli.allow_unsandboxed,
         min_release_age: cli.min_release_age.clone(),
+        sandbox: cli.sandbox,
     })?;
     config.validate(&ecosystem::names())?;
 
@@ -259,17 +266,26 @@ fn run_project(
         );
     }
 
+    let sandbox = match config.sandbox.as_ref().filter(|s| s.enabled) {
+        Some(s) => Some(sandbox::Sandbox::new(s, eco.as_ref())?),
+        None => None,
+    };
     let ctx = verify::VerifyContext {
         eco: eco.as_ref(),
         project,
         commands: project.commands(eco.default_commands(&project.path)),
         timeout: project.timeout,
+        sandbox: sandbox.as_ref(),
         policy: &config.policy,
         ignores: &config.ignores,
         now,
     };
     let result = verify_plan(cli, &ctx, osv, &mut project_plan, &mut |dir| {
-        safety::enforce(&config.safety, dir)
+        if sandbox.is_some() {
+            safety::enforce_project(&config.safety, dir)
+        } else {
+            safety::enforce(&config.safety, dir)
+        }
     });
     // Also on errors (e.g. a safety refusal): the plan is still worth reporting.
     report.findings = project_plan.findings;
@@ -356,6 +372,7 @@ mod tests {
             project: &project,
             commands: Default::default(),
             timeout: None,
+            sandbox: None,
             policy: &policy,
             ignores: &[],
             now: jiff::Timestamp::now(),
