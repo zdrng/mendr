@@ -587,6 +587,7 @@ enum Run {
 /// reason (`BaselineFailed` vs `InstallFailed`/`BuildFailed`/...).
 fn run_steps(ctx: &VerifyContext, dir: &Path, baseline: bool) -> Result<(), FailReason> {
     let c = &ctx.commands;
+    let env = ctx.eco.command_env();
     let steps = [
         (Step::Install, &c.install),
         (Step::Build, &c.build),
@@ -595,7 +596,7 @@ fn run_steps(ctx: &VerifyContext, dir: &Path, baseline: bool) -> Result<(), Fail
     for (step, command) in steps {
         let Some(command) = command else { continue };
         let command = command.clone();
-        let (exit_code, log_tail) = match run_shell(dir, &command, ctx.timeout, ctx.sandbox) {
+        let (exit_code, log_tail) = match run_shell(dir, &command, &env, ctx.timeout, ctx.sandbox) {
             Run::Ok => continue,
             Run::Failed {
                 exit_code,
@@ -651,10 +652,12 @@ fn run_steps(ctx: &VerifyContext, dir: &Path, baseline: bool) -> Result<(), Fail
 /// started in the background keeps running in the copy. A zero timeout
 /// counts as none. On an interrupt this unwinds (see [`check_interrupted`]).
 /// With a `sandbox`, the process is the engine CLI running the command in
-/// a new container, which is removed if the CLI had to be killed.
+/// a new container, which is removed if the CLI had to be killed; `env`
+/// ([`Ecosystem::command_env`]) is then already part of the sandbox.
 fn run_shell(
     dir: &Path,
     command: &str,
+    env: &[(String, String)],
     timeout: Option<Duration>,
     sandbox: Option<&Sandbox>,
 ) -> Run {
@@ -682,6 +685,7 @@ fn run_shell(
         None => {
             let mut sh = Command::new("sh");
             sh.arg("-c").arg(command);
+            crate::ecosystem::set_env(&mut sh, env);
             sh
         }
     };
@@ -1667,6 +1671,7 @@ mod tests {
         let run = run_shell(
             dir.path(),
             "sleep 30 & echo $! > bg.pid; exit 0",
+            &[],
             None,
             None,
         );
@@ -1676,9 +1681,30 @@ mod tests {
     }
 
     #[test]
+    fn commands_get_the_ecosystem_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = [(
+            "npm_config_registry".to_string(),
+            "https://registry.npmjs.org/".to_string(),
+        )];
+        let run = run_shell(
+            dir.path(),
+            "echo \"$npm_config_registry\" > out",
+            &env,
+            None,
+            None,
+        );
+        assert!(matches!(run, Run::Ok));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("out")).unwrap(),
+            "https://registry.npmjs.org/\n"
+        );
+    }
+
+    #[test]
     fn zero_timeout_is_no_timeout() {
         let dir = tempfile::tempdir().unwrap();
-        let run = run_shell(dir.path(), "sleep 0.1", Some(Duration::ZERO), None);
+        let run = run_shell(dir.path(), "sleep 0.1", &[], Some(Duration::ZERO), None);
         assert!(matches!(run, Run::Ok));
     }
 
@@ -1792,7 +1818,7 @@ mod tests {
                 "(trap '' TERM; sleep 30) & echo $! > '{p}.tmp'; mv '{p}.tmp' '{p}'; wait",
                 p = pid.display()
             );
-            run_shell(work.path(), &command, None, None);
+            run_shell(work.path(), &command, &[], None, None);
         });
         std::process::exit(result.err().map_or(0, |i| i.exit_code().into()));
     }

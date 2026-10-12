@@ -13,6 +13,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::NpmConfig;
 use crate::ecosystem::{AdapterError, DeclaredDep, Release};
 use crate::model::{Version, VersionReq};
 
@@ -31,12 +32,13 @@ pub struct PackageInfo {
     pub deps: BTreeMap<String, Vec<DeclaredDep>>,
 }
 
-/// Registry base URL: `$npm_config_registry` (as npm reads it) or the
-/// public registry. `.npmrc` files are not read.
-pub fn registry_url() -> String {
-    let url = std::env::var("npm_config_registry")
-        .or_else(|_| std::env::var("NPM_CONFIG_REGISTRY"))
-        .unwrap_or_else(|_| DEFAULT_REGISTRY.to_string());
+/// Registry base URL, ending in `/`: `[npm] registry`, else
+/// `$npm_config_registry` (as npm reads it), else the public registry.
+/// `.npmrc` files are not read.
+pub fn registry_url(config: &NpmConfig) -> String {
+    let url = config
+        .registry_or_env(|k| std::env::var(k).ok())
+        .unwrap_or_else(|| DEFAULT_REGISTRY.to_string());
     if url.ends_with('/') { url } else { url + "/" }
 }
 
@@ -45,16 +47,16 @@ pub fn packument_url(registry: &str, name: &str) -> String {
     format!("{registry}{}", name.replace('/', "%2f"))
 }
 
-/// Fetch (or load from cache) the info for `name`.
-pub fn fetch(name: &str) -> Result<PackageInfo, AdapterError> {
-    let registry = registry_url();
+/// Fetch (or load from cache) the info for `name` from `registry` (see
+/// [`registry_url`]).
+pub fn fetch(registry: &str, name: &str) -> Result<PackageInfo, AdapterError> {
     let key = format!("{registry}{name} v{CACHE_FORMAT}");
     if let Some(text) = crate::cache::read("npm", &key, Some(MAX_AGE))
         && let Ok(info) = serde_json::from_str(&text)
     {
         return Ok(info);
     }
-    let url = packument_url(&registry, name);
+    let url = packument_url(registry, name);
     let body =
         crate::http::get_string(&url, &[("Accept", "application/json")]).map_err(|e| match e {
             crate::http::HttpError::NotFound(_) => AdapterError::NotFound(name.to_string()),
@@ -230,6 +232,15 @@ mod tests {
         assert_eq!(
             packument_url(DEFAULT_REGISTRY, "minimist"),
             "https://registry.npmjs.org/minimist"
+        );
+        let config = NpmConfig {
+            registry: Some("https://npm.example/repo".into()),
+            replace_registry_host: None,
+        };
+        assert_eq!(registry_url(&config), "https://npm.example/repo/");
+        assert_eq!(
+            packument_url(&registry_url(&config), "@scope/pkg"),
+            "https://npm.example/repo/@scope%2fpkg"
         );
     }
 }

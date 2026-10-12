@@ -123,7 +123,7 @@ fn run(cli: &Cli) -> Result<u8> {
 
     let mut osv = match &cli.osv_snapshot {
         Some(dir) => Osv::snapshot(&cwd.join(dir))?,
-        None => Osv::live(),
+        None => Osv::live(&config.osv),
     };
     let now = jiff::Timestamp::now();
     let today = rules::today(now);
@@ -178,10 +178,11 @@ fn run(cli: &Cli) -> Result<u8> {
     Ok(report.exit_code() as u8)
 }
 
-fn ecosystem_for(project: &ProjectConfig) -> Result<Box<dyn Ecosystem>> {
+fn ecosystem_for(config: &Config, project: &ProjectConfig) -> Result<Box<dyn Ecosystem>> {
     match &project.ecosystem {
-        Some(name) => ecosystem::by_name(name).ok_or_else(|| anyhow!("unknown ecosystem `{name}`")),
-        None => ecosystem::detect_ecosystem(&project.path).ok_or_else(|| {
+        Some(name) => ecosystem::by_name(name, &config.npm)
+            .ok_or_else(|| anyhow!("unknown ecosystem `{name}`")),
+        None => ecosystem::detect_ecosystem(&project.path, &config.npm).ok_or_else(|| {
             anyhow!(
                 "no supported project with a lockfile found in {} (supported: {})",
                 project.path.display(),
@@ -203,7 +204,7 @@ fn run_project(
     if !project.path.is_dir() {
         anyhow::bail!("{} is not a directory", project.path.display());
     }
-    let eco = ecosystem_for(project)?;
+    let eco = ecosystem_for(config, project)?;
     report.ecosystem = Some(eco.name().to_string());
     progress::line(
         "Scanning",

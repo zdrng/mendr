@@ -21,11 +21,12 @@ use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::IgnoreRule;
+use crate::config::{IgnoreRule, OsvConfig};
 use crate::ecosystem::Ecosystem;
 use crate::model::{DepGraph, NodeId, Version};
 
-/// Default API base URL; `MENDR_OSV_API` overrides it (mirrors, tests).
+/// Default API base URL; `[osv] api` or `MENDR_OSV_API` replaces it
+/// (mirrors, tests).
 const OSV_API: &str = "https://api.osv.dev/v1";
 const BATCH_SIZE: usize = 500;
 /// Parallel `GET /v1/vulns/{id}` requests.
@@ -695,11 +696,10 @@ impl Osv {
         Ok(Osv::Snapshot(load_snapshot(dir)?))
     }
 
-    /// The osv.dev API, or `$MENDR_OSV_API` when set and not empty.
-    pub fn live() -> Osv {
-        let api = std::env::var("MENDR_OSV_API")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
+    /// `[osv] api`, else `$MENDR_OSV_API` when set and not empty, else the
+    /// osv.dev API.
+    pub fn live(config: &OsvConfig) -> Osv {
+        let api = config.api_or_env(|k| std::env::var(k).ok());
         Osv::live_at(
             api.as_deref().unwrap_or(OSV_API),
             &crate::cache::cache_dir(),
@@ -1219,7 +1219,7 @@ mod tests {
     fn live_osv_smoke() {
         let mut eco = Fake::new();
         eco.osv_name = Some("crates.io");
-        let mut osv = Osv::live();
+        let mut osv = Osv::live(&OsvConfig::default());
         let adv = osv.advisories(&eco, &["smallvec".to_string()]).unwrap();
         let a = adv
             .iter()

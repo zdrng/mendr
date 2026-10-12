@@ -17,6 +17,13 @@
 //! engine = "docker"             # docker | podman
 //! image = "docker.io/library/rust:1"
 //!
+//! [npm]                         # npm projects; both keys optional
+//! registry = "https://registry.npmjs.org/"
+//! replace-registry-host = "always"   # npmjs | always | never | <host>
+//!
+//! [osv]
+//! api = "https://api.osv.dev/v1"     # optional
+//!
 //! [[project]]                   # repeatable; default: one project at "."
 //! path = "apps/web"             # relative to the config file
 //! ecosystem = "npm"             # optional, auto-detected
@@ -32,7 +39,9 @@
 //! ```
 //!
 //! Unknown keys are rejected. Without a config file mendr uses the defaults
-//! and a single auto-detected project in the current directory.
+//! and a single auto-detected project in the current directory. `[npm]` and
+//! `[osv]` values win over their environment variables (see
+//! [`NpmConfig::registry_or_env`], [`OsvConfig::api_or_env`]).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -165,6 +174,57 @@ pub struct SandboxConfig {
     pub enabled: bool,
 }
 
+/// `[npm]`: registry settings for npm projects. No tokens: those stay in
+/// `.npmrc` outside the project or in environment variables.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NpmConfig {
+    /// http(s) URL.
+    pub registry: Option<String>,
+    /// `npmjs`, `always`, `never` or a host name.
+    pub replace_registry_host: Option<String>,
+}
+
+impl NpmConfig {
+    /// `registry`, else `$npm_config_registry` / `$NPM_CONFIG_REGISTRY`.
+    pub fn registry_or_env(&self, var: impl Fn(&str) -> Option<String>) -> Option<String> {
+        self.registry
+            .clone()
+            .or_else(|| var("npm_config_registry"))
+            .or_else(|| var("NPM_CONFIG_REGISTRY"))
+    }
+
+    /// Environment for npm child processes: the configured keys only, so
+    /// unset ones keep whatever the environment has.
+    pub fn child_env(&self) -> Vec<(String, String)> {
+        [
+            ("npm_config_registry", &self.registry),
+            (
+                "npm_config_replace_registry_host",
+                &self.replace_registry_host,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(k, v)| Some((k.to_string(), v.clone()?)))
+        .collect()
+    }
+}
+
+/// `[osv]`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OsvConfig {
+    /// API base URL (http(s)).
+    pub api: Option<String>,
+}
+
+impl OsvConfig {
+    /// `api`, else a non-empty `$MENDR_OSV_API`.
+    pub fn api_or_env(&self, var: impl Fn(&str) -> Option<String>) -> Option<String> {
+        self.api
+            .clone()
+            .or_else(|| var("MENDR_OSV_API").filter(|v| !v.trim().is_empty()))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     /// Directory the config file lives in (or the cwd without a file).
@@ -175,6 +235,8 @@ pub struct Config {
     pub safety: SafetyConfig,
     /// `[sandbox]`, if the file has one.
     pub sandbox: Option<SandboxConfig>,
+    pub npm: NpmConfig,
+    pub osv: OsvConfig,
     pub projects: Vec<ProjectConfig>,
     pub ignores: Vec<IgnoreRule>,
 }
@@ -196,6 +258,10 @@ struct RawConfig {
     #[serde(default)]
     safety: RawSafety,
     sandbox: Option<RawSandbox>,
+    #[serde(default)]
+    npm: RawNpm,
+    #[serde(default)]
+    osv: RawOsv,
     #[serde(default)]
     project: Vec<RawProject>,
     #[serde(default)]
@@ -226,6 +292,19 @@ struct RawSafety {
 struct RawSandbox {
     engine: Engine,
     image: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct RawNpm {
+    registry: Option<String>,
+    replace_registry_host: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct RawOsv {
+    api: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -276,6 +355,32 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     Ok(Duration::from_secs(total))
 }
 
+/// An `http://` or `https://` URL with a host.
+fn http_url(s: &str) -> Result<String> {
+    let s = s.trim();
+    let rest = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .with_context(|| format!("`{s}` is not an http(s) URL"))?;
+    if rest.is_empty() || rest.starts_with('/') || rest.contains(char::is_whitespace) {
+        bail!("`{s}` is not an http(s) URL");
+    }
+    Ok(s.to_string())
+}
+
+/// npm's `replace-registry-host`: `npmjs`, `always`, `never` or a host
+/// (optionally with a port).
+fn replace_registry_host(s: &str) -> Result<String> {
+    let s = s.trim();
+    let host = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'));
+    if !host {
+        bail!("`{s}` must be \"npmjs\", \"always\", \"never\" or a host name");
+    }
+    Ok(s.to_string())
+}
+
 /// `~` and `~/...` stay as they are (the safety check expands them against
 /// `HOME`); other relative paths are joined onto `base_dir`.
 fn resolve_deny_path(path: String, base_dir: &Path) -> String {
@@ -312,6 +417,8 @@ impl Config {
             policy: Policy::default(),
             safety: SafetyConfig::default(),
             sandbox: None,
+            npm: NpmConfig::default(),
+            osv: OsvConfig::default(),
             projects: vec![ProjectConfig::at(base_dir.to_path_buf())],
             ignores: Vec::new(),
         }
@@ -336,6 +443,25 @@ impl Config {
         if let Some(v) = raw.policy.target {
             policy.target = v;
         }
+        let npm = NpmConfig {
+            registry: raw
+                .npm
+                .registry
+                .map(|v| http_url(&v).context("npm.registry"))
+                .transpose()?,
+            replace_registry_host: raw
+                .npm
+                .replace_registry_host
+                .map(|v| replace_registry_host(&v).context("npm.replace-registry-host"))
+                .transpose()?,
+        };
+        let osv = OsvConfig {
+            api: raw
+                .osv
+                .api
+                .map(|v| http_url(&v).context("osv.api"))
+                .transpose()?,
+        };
         let mut projects = Vec::new();
         for p in raw.project {
             // "0" means no timeout (not "kill at once").
@@ -388,6 +514,8 @@ impl Config {
                 image: s.image,
                 enabled: false,
             }),
+            npm,
+            osv,
             projects,
             ignores,
         })
@@ -638,6 +766,131 @@ expires = "2027-01-02"
             })
             .unwrap_err();
         assert!(err.to_string().contains("[sandbox] section"), "{err}");
+    }
+
+    #[test]
+    fn npm_and_osv_sections() {
+        let c = Config::parse(
+            r#"
+[npm]
+registry = "https://registry.npmjs.org/"
+replace-registry-host = "always"
+
+[osv]
+api = "https://osv.intern.example/v1"
+"#,
+            Path::new("/r"),
+        )
+        .unwrap();
+        assert_eq!(
+            c.npm,
+            NpmConfig {
+                registry: Some("https://registry.npmjs.org/".into()),
+                replace_registry_host: Some("always".into()),
+            }
+        );
+        assert_eq!(c.osv.api.as_deref(), Some("https://osv.intern.example/v1"));
+        assert_eq!(
+            c.npm.child_env(),
+            vec![
+                (
+                    "npm_config_registry".into(),
+                    "https://registry.npmjs.org/".into()
+                ),
+                ("npm_config_replace_registry_host".into(), "always".into()),
+            ]
+        );
+
+        for host in [
+            "npmjs",
+            "never",
+            "npm.intern.example",
+            "npm.intern.example:8443",
+        ] {
+            let text = format!("[npm]\nreplace-registry-host = \"{host}\"\n");
+            let c = Config::parse(&text, Path::new("/r")).unwrap();
+            assert_eq!(c.npm.replace_registry_host.as_deref(), Some(host));
+        }
+
+        let c = Config::default_at(Path::new("/r"));
+        assert_eq!(c.npm, NpmConfig::default());
+        assert!(c.npm.child_env().is_empty());
+        assert_eq!(c.osv, OsvConfig::default());
+    }
+
+    #[test]
+    fn npm_and_osv_validation() {
+        for (bad, key) in [
+            ("[npm]\nregistry = \"registry.npmjs.org\"\n", "npm.registry"),
+            ("[npm]\nregistry = \"ftp://x/\"\n", "npm.registry"),
+            ("[npm]\nregistry = \"https://\"\n", "npm.registry"),
+            (
+                "[npm]\nreplace-registry-host = \"\"\n",
+                "npm.replace-registry-host",
+            ),
+            (
+                "[npm]\nreplace-registry-host = \"https://x\"\n",
+                "npm.replace-registry-host",
+            ),
+            ("[osv]\napi = \"osv.dev\"\n", "osv.api"),
+        ] {
+            let err = Config::parse(bad, Path::new("/r")).unwrap_err();
+            assert!(format!("{err:#}").contains(key), "{bad:?}: {err:#}");
+        }
+        for bad in [
+            "[npm]\ntoken = \"x\"\n",
+            "[npm]\n_authToken = \"x\"\n",
+            "[osv]\nurl = \"https://x\"\n",
+        ] {
+            assert!(Config::parse(bad, Path::new("/r")).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn config_wins_over_env() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                vars.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let all = env(&[
+            ("npm_config_registry", "https://lower.example/"),
+            ("NPM_CONFIG_REGISTRY", "https://upper.example/"),
+            ("MENDR_OSV_API", "https://env-osv.example/v1"),
+        ]);
+        let set = Config::parse(
+            "[npm]\nregistry = \"https://file.example/\"\n[osv]\napi = \"https://file-osv.example/v1\"\n",
+            Path::new("/r"),
+        )
+        .unwrap();
+        assert_eq!(
+            set.npm.registry_or_env(all).as_deref(),
+            Some("https://file.example/")
+        );
+        assert_eq!(
+            set.osv.api_or_env(all).as_deref(),
+            Some("https://file-osv.example/v1")
+        );
+
+        let unset = Config::default_at(Path::new("/r"));
+        assert_eq!(
+            unset.npm.registry_or_env(all).as_deref(),
+            Some("https://lower.example/")
+        );
+        let upper = env(&[("NPM_CONFIG_REGISTRY", "https://upper.example/")]);
+        assert_eq!(
+            unset.npm.registry_or_env(upper).as_deref(),
+            Some("https://upper.example/")
+        );
+        assert_eq!(
+            unset.osv.api_or_env(all).as_deref(),
+            Some("https://env-osv.example/v1")
+        );
+        let blank = env(&[("MENDR_OSV_API", " ")]);
+        assert_eq!(unset.osv.api_or_env(blank), None);
+        assert_eq!(unset.npm.registry_or_env(env(&[])), None);
     }
 
     #[test]

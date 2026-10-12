@@ -110,6 +110,13 @@ deny-paths = ["~/.aws", "/etc/secrets"]   # extra paths that must not be readabl
 engine = "docker"            # docker | podman
 image = "docker.io/library/rust:1"        # must contain the project's toolchain
 
+[npm]                        # npm projects; both keys optional
+registry = "https://registry.npmjs.org/"  # http(s) URL
+replace-registry-host = "always"          # npmjs | always | never | a host name
+
+[osv]
+api = "https://osv.intern.example/v1"     # optional OSV API base URL (http(s))
+
 [[project]]                  # repeatable; default: one project at "."
 path = "services/api"        # ecosystem auto-detected
 timeout = "20m"              # per command; default and "0": no timeout
@@ -127,6 +134,26 @@ id = "GHSA-xxxx-yyyy-zzzz"   # the advisory id or any alias (CVE, RUSTSEC, ...),
 reason = "not reachable: we never parse untrusted input"
 expires = 2026-12-31         # optional, inclusive (UTC); afterwards the advisory counts again
 ```
+
+`[npm]` and `[osv]` values win over the environment; a key that is not set falls back to it:
+
+| key | used for | fallback |
+|-----|----------|----------|
+| `npm.registry` | mendr's registry lookups and npm's `registry` | `$npm_config_registry`, `$NPM_CONFIG_REGISTRY`, then `https://registry.npmjs.org/` |
+| `npm.replace-registry-host` | npm's `replace-registry-host` | `$npm_config_replace_registry_host`, then npm's default (`npmjs`) |
+| `osv.api` | OSV API base URL | `$MENDR_OSV_API` (if not empty), then `https://api.osv.dev/v1` |
+
+Configured `[npm]` keys are passed to every npm process mendr starts as `npm_config_registry` /
+`npm_config_replace_registry_host` (replacing an upper-case `NPM_CONFIG_*` spelling): the
+`npm install --package-lock-only` that applies a change and the install, build and test commands,
+including commands set in `[[project]]` (they run through `sh`, so any `npm` they call sees them),
+also with `--sandbox`. Example: a `package-lock.json` whose `resolved` URLs point at a company
+registry can be installed from the public one with `registry = "https://registry.npmjs.org/"`
+and `replace-registry-host = "always"` (npm then ignores the host in `resolved`).
+
+`mendr.toml` holds no credentials and has no token key. Registry tokens still come from an
+`.npmrc` outside the project or from environment variables, and the [safety checks](#safety)
+treat them as before.
 
 Default commands:
 
@@ -191,9 +218,12 @@ image = "docker.io/library/rust:1-slim"    # e.g. docker.io/library/node:22-slim
 
 - The container sees only the project's temp copy and a temp `HOME` for tool caches (npm, pnpm,
   and the Cargo registry), both at the same paths as on the host, and removed after the project.
-  No environment variables, files or sockets of the host get in; it runs as your user (Podman:
-  `--userns=keep-id`, so rootless Podman) with all capabilities dropped. The network stays on:
-  installs need the registries.
+  No environment variables, files or sockets of the host get in (only the configured `[npm]`
+  keys, as `npm_config_*`; a registry set only through a host variable does not reach the
+  container); it runs as your user (Podman: `--userns=keep-id`, so rootless Podman) with all
+  capabilities dropped. The network stays on: installs need the registries, which must be
+  reachable from the container (a registry on the host's `localhost` or behind a host-only VPN
+  or proxy may not be).
 - Scanning, planning, resolving the lockfile and `--write` still run on the host (they run no
   project or dependency code), so the host still needs the package manager. The image's
   toolchain should be at least as new as the host's (e.g. a newer host Cargo may write a
@@ -242,10 +272,12 @@ Limitations:
   the release-age check on the resulting lockfile is the only guard for new transitive versions.
   Path dependencies outside the project directory are missing in the temp copy; point
   `[[project]] path` at the workspace root.
-- npm: the registry is `$npm_config_registry` or the public one; `.npmrc` files are not read.
-  Bundled dependencies are not scanned.
+- npm: the registry is `[npm] registry`, `$npm_config_registry` or the public one (see
+  [Configuration](#configuration-mendrtoml)); `.npmrc` files are not read by mendr (npm itself
+  still reads them). Bundled dependencies are not scanned.
 - pnpm: changes need pnpm >= 10 (lockfiles from pnpm 9 are read). The registry is
-  `$pnpm_config_registry`, `$npm_config_registry` or the public one; `.npmrc` and
+  `$pnpm_config_registry`, `$npm_config_registry` or the public one (`[npm]` does not apply);
+  `.npmrc` and
   `pnpm-workspace.yaml` settings are not read. Dependencies declared through a pnpm catalog
   (`catalog:`) are not bumped (`manifest_not_editable`). The lockfile does not record the ranges
   that registry packages declare, so they are fetched once per package version from the registry
@@ -258,7 +290,7 @@ OSV responses and registry metadata are cached under `$MENDR_CACHE_DIR`,
 `$XDG_CACHE_HOME/mendr` or `~/.cache/mendr` (empty variables are ignored; without `HOME`, a
 `mendr-<uid>` directory in the system temp directory). Entries unused for 30 days are deleted at
 startup. Failed requests (connection errors, timeouts, HTTP 408, 429 and 5xx) are retried three
-times with backoff. `MENDR_OSV_API` replaces the OSV API base URL (default
+times with backoff. `[osv] api` or `MENDR_OSV_API` replaces the OSV API base URL (default
 `https://api.osv.dev/v1`), e.g. with a mirror.
 
 ## Development

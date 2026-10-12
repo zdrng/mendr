@@ -9,8 +9,9 @@
 //!   caches (npm, pnpm, Cargo registry via [`Ecosystem::sandbox_env`])
 //!   outlive a single command. Removed when the [`Sandbox`] is dropped.
 //!
-//! Nothing else from the host gets in: no environment variables, no other
-//! files, no sockets. The command runs as the invoking user (Docker:
+//! Nothing else from the host gets in: no environment variables (only
+//! [`Ecosystem::command_env`], e.g. `[npm]` settings), no other files, no
+//! sockets. The command runs as the invoking user (Docker:
 //! `--user uid:gid`; Podman: `--userns=keep-id`, i.e. rootless Podman), so
 //! files it writes into the copy can be removed afterwards, with all
 //! capabilities dropped. The network stays on (installs need registries).
@@ -24,7 +25,7 @@
 //! Scanning, planning, graph resolution and `--write` stay on the host: they
 //! run no project or dependency code.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -45,8 +46,9 @@ pub struct Sandbox {
     image: String,
     /// `HOME` in the container.
     home: TempDir,
-    /// [`Ecosystem::sandbox_env`] with paths joined onto `home`.
-    env: Vec<(String, PathBuf)>,
+    /// [`Ecosystem::sandbox_env`] with paths joined onto `home`, then
+    /// [`Ecosystem::command_env`].
+    env: Vec<(String, String)>,
 }
 
 impl Sandbox {
@@ -59,7 +61,11 @@ impl Sandbox {
         let env = eco
             .sandbox_env()
             .iter()
-            .map(|(k, rel)| (k.to_string(), home.path().join(rel)))
+            .map(|(k, rel)| {
+                let path = home.path().join(rel);
+                (k.to_string(), path.display().to_string())
+            })
+            .chain(eco.command_env())
             .collect();
         Ok(Sandbox {
             engine: config.engine,
@@ -157,8 +163,8 @@ impl Sandbox {
             "-e".into(),
             format!("HOME={home}"),
         ]);
-        for (key, path) in &self.env {
-            args.extend(["-e".into(), format!("{key}={}", path.display())]);
+        for (key, value) in &self.env {
+            args.extend(["-e".into(), format!("{key}={value}")]);
         }
         args.extend([self.image.clone(), "sh".into(), "-c".into(), script.into()]);
         args
@@ -245,6 +251,22 @@ mod tests {
         assert!(!args.iter().any(|a| a.starts_with("--userns")));
         let cargo_home = format!("CARGO_HOME={home}/.cargo");
         assert!(args.windows(2).any(|w| w == ["-e", cargo_home.as_str()]));
+    }
+
+    #[test]
+    fn npm_settings_reach_the_container() {
+        let npm = crate::ecosystem::npm::Npm::new(crate::config::NpmConfig {
+            registry: Some("https://registry.npmjs.org/".into()),
+            replace_registry_host: Some("always".into()),
+        });
+        let s = sandbox(Engine::Podman, &npm);
+        let args = s.args(Path::new("/w"), "npm ci", "n");
+        for env in [
+            "npm_config_registry=https://registry.npmjs.org/",
+            "npm_config_replace_registry_host=always",
+        ] {
+            assert!(args.windows(2).any(|w| w == ["-e", env]), "{env}: {args:?}");
+        }
     }
 
     #[test]

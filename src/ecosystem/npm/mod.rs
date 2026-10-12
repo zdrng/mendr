@@ -41,24 +41,33 @@ use self::manifest::{JsonFile, SpecBump};
 use self::registry::PackageInfo;
 use self::semver::{Range, Ver};
 use super::{AdapterError, ApplyOptions, Commands, DeclaredDep, Ecosystem, Release};
+use crate::config::NpmConfig;
 use crate::model::{BumpKind, Change, DepGraph, Strategy, Version, VersionReq};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Npm {
+    config: NpmConfig,
+    /// [`registry::registry_url`] of `config`.
+    registry: String,
     /// Packument subsets fetched in this run.
     packages: RefCell<HashMap<String, Rc<PackageInfo>>>,
 }
 
 impl Npm {
-    pub fn new() -> Self {
-        Self::default()
+    /// With `[npm]` from `mendr.toml`.
+    pub fn new(config: NpmConfig) -> Self {
+        Npm {
+            registry: registry::registry_url(&config),
+            config,
+            packages: RefCell::default(),
+        }
     }
 
     fn info(&self, name: &str) -> Result<Rc<PackageInfo>, AdapterError> {
         if let Some(info) = self.packages.borrow().get(name) {
             return Ok(info.clone());
         }
-        let info = Rc::new(registry::fetch(name)?);
+        let info = Rc::new(registry::fetch(&self.registry, name)?);
         self.packages
             .borrow_mut()
             .insert(name.to_string(), info.clone());
@@ -162,7 +171,7 @@ impl Ecosystem for Npm {
                 file.write(&path)?;
             }
         }
-        npm_install(workdir, opts)
+        run_npm(&mut install_command(workdir, opts, &self.command_env()))
     }
 
     fn default_commands(&self, project_dir: &Path) -> Commands {
@@ -193,6 +202,10 @@ impl Ecosystem for Npm {
 
     fn manifest_files(&self) -> &'static [&'static str] {
         &["package.json", "package-lock.json", "npm-shrinkwrap.json"]
+    }
+
+    fn command_env(&self) -> Vec<(String, String)> {
+        self.config.child_env()
     }
 
     fn releases(&self, package: &str) -> Result<Vec<Release>, AdapterError> {
@@ -304,9 +317,10 @@ fn bump_declarations(
 }
 
 /// `npm install --package-lock-only` without scripts, honouring the release
-/// cutoff.
-fn npm_install(workdir: &Path, opts: &ApplyOptions) -> Result<(), AdapterError> {
+/// cutoff, with `env` ([`Ecosystem::command_env`]).
+fn install_command(workdir: &Path, opts: &ApplyOptions, env: &[(String, String)]) -> Command {
     let mut cmd = Command::new("npm");
+    super::set_env(&mut cmd, env);
     cmd.current_dir(workdir).args([
         "install",
         "--package-lock-only",
@@ -321,7 +335,7 @@ fn npm_install(workdir: &Path, opts: &ApplyOptions) -> Result<(), AdapterError> 
             cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
         ));
     }
-    run_npm(&mut cmd)
+    cmd
 }
 
 /// npm error codes that mean "this change cannot be resolved".
@@ -382,7 +396,7 @@ mod tests {
 
     #[test]
     fn version_semantics() {
-        let npm = Npm::new();
+        let npm = Npm::new(NpmConfig::default());
         let sat = |r: &str, ver: &str| npm.satisfies(&VersionReq::new(r), &v(ver));
         assert!(sat("^1.2.5", "1.2.6"));
         assert!(!sat("0.0.8", "1.2.6"));
@@ -413,7 +427,7 @@ mod tests {
     #[test]
     fn detection_and_commands() {
         let dir = tempfile::tempdir().unwrap();
-        let npm = Npm::new();
+        let npm = Npm::new(NpmConfig::default());
         std::fs::write(
             dir.path().join("package.json"),
             r#"{"scripts": {"test": "echo \"Error: no test specified\" && exit 1"}}"#,
@@ -436,6 +450,34 @@ mod tests {
         let c = npm.default_commands(dir.path());
         assert_eq!(c.build.as_deref(), Some("npm run build"));
         assert_eq!(c.test.as_deref(), Some("npm test"));
+    }
+
+    #[test]
+    fn npm_gets_the_configured_registry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let npm = Npm::new(NpmConfig {
+            registry: Some("https://registry.npmjs.org".into()),
+            replace_registry_host: Some("always".into()),
+        });
+        assert_eq!(npm.registry, "https://registry.npmjs.org/");
+        let bin = tempfile::tempdir().unwrap();
+        let fake = bin.path().join("npm");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho \"$npm_config_registry|$npm_config_replace_registry_host|$*\" > out\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let mut cmd = install_command(work.path(), &ApplyOptions::default(), &npm.command_env());
+        cmd.env("PATH", bin.path());
+        run_npm(&mut cmd).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("out")).unwrap(),
+            "https://registry.npmjs.org|always|install --package-lock-only --ignore-scripts \
+             --no-audit --no-fund --no-update-notifier\n"
+        );
     }
 
     #[test]
@@ -560,7 +602,7 @@ mod tests {
                 Some(("\"path-to-regexp@0.1.7 - 0.1.13\": \"0.1.13\"", "", "")),
             ),
         ];
-        let npm = Npm::new();
+        let npm = Npm::new(NpmConfig::default());
         for (name, change, manifest_check) in cases {
             let src = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("test-projects/npm")
@@ -614,7 +656,12 @@ mod tests {
             r#"{"dependencies": {"react": "17.0.2", "react-dom": "17.0.2"}}"#,
         )
         .unwrap();
-        npm_install(dir.path(), &ApplyOptions::default()).unwrap();
+        run_npm(&mut install_command(
+            dir.path(),
+            &ApplyOptions::default(),
+            &[],
+        ))
+        .unwrap();
         let bump = Change::DirectBump {
             package: "react-dom".into(),
             from: v("17.0.2"),

@@ -20,6 +20,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::NpmConfig;
 use crate::model::{BumpKind, Change, DepGraph, FailReason, Strategy, Version, VersionReq};
 
 // ---- Adapter modules (registration point 1 of 2) ---------------------------
@@ -31,27 +32,30 @@ pub mod pnpm;
 // -----------------------------------------------------------------------------
 
 /// All real adapters, in detection priority order (registration point 2 of 2).
-pub fn ecosystems() -> Vec<Box<dyn Ecosystem>> {
+pub fn ecosystems(npm: &NpmConfig) -> Vec<Box<dyn Ecosystem>> {
     vec![
         Box::new(cargo::Cargo::new()),
-        Box::new(npm::Npm::new()),
+        Box::new(npm::Npm::new(npm.clone())),
         Box::new(pnpm::Pnpm::new()),
     ]
 }
 
 /// The adapter whose `name()` equals `name`.
-pub fn by_name(name: &str) -> Option<Box<dyn Ecosystem>> {
-    ecosystems().into_iter().find(|e| e.name() == name)
+pub fn by_name(name: &str, npm: &NpmConfig) -> Option<Box<dyn Ecosystem>> {
+    ecosystems(npm).into_iter().find(|e| e.name() == name)
 }
 
 /// Names of all registered adapters (used to validate `mendr.toml`).
 pub fn names() -> Vec<&'static str> {
-    ecosystems().iter().map(|e| e.name()).collect()
+    ecosystems(&NpmConfig::default())
+        .iter()
+        .map(|e| e.name())
+        .collect()
 }
 
 /// The first registered adapter whose `detect(dir)` returns true.
-pub fn detect_ecosystem(dir: &Path) -> Option<Box<dyn Ecosystem>> {
-    ecosystems().into_iter().find(|e| e.detect(dir))
+pub fn detect_ecosystem(dir: &Path, npm: &NpmConfig) -> Option<Box<dyn Ecosystem>> {
+    ecosystems(npm).into_iter().find(|e| e.detect(dir))
 }
 
 /// One published version of a package.
@@ -240,6 +244,13 @@ pub trait Ecosystem {
         &[]
     }
 
+    /// Extra environment for install/build/test commands, on the host and
+    /// in a `--sandbox` container (e.g. npm registry settings from
+    /// `mendr.toml`). Applied with [`set_env`]. Empty by default.
+    fn command_env(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     // ---- Registry --------------------------------------------------------------
 
     /// All published versions of `package` (any order, including yanked).
@@ -273,6 +284,19 @@ pub fn run(cmd: &mut Command) -> Result<String, AdapterError> {
             exit_code: output.status.code(),
             stderr_tail: crate::model::log_tail(&String::from_utf8_lossy(&output.stderr)),
         })
+    }
+}
+
+/// Set `env` on `cmd`, dropping other-case spellings of the same names
+/// (`NPM_CONFIG_REGISTRY` for `npm_config_registry`) so the value given
+/// here is the one the tool sees.
+pub fn set_env(cmd: &mut Command, env: &[(String, String)]) {
+    for (key, value) in env {
+        let upper = key.to_ascii_uppercase();
+        if upper != *key {
+            cmd.env_remove(upper);
+        }
+        cmd.env(key, value);
     }
 }
 
@@ -326,6 +350,22 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(run(&mut Command::new("/nonexistent/program")).is_err());
+    }
+
+    #[test]
+    fn set_env_overrides_other_spellings() {
+        let mut cmd = Command::new("sh");
+        cmd.env("NPM_CONFIG_REGISTRY", "https://upper.example/");
+        set_env(
+            &mut cmd,
+            &[("npm_config_registry".into(), "https://file.example/".into())],
+        );
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(envs.contains(&("NPM_CONFIG_REGISTRY".as_ref(), None)));
+        assert!(envs.contains(&(
+            "npm_config_registry".as_ref(),
+            Some("https://file.example/".as_ref())
+        )));
     }
 
     #[test]
