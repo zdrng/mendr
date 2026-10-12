@@ -11,6 +11,7 @@
 //! [safety]
 //! allow-unsandboxed = false
 //! deny-paths = ["~/.aws"]       # extra paths that must not be readable
+//!                               # (`~/` = HOME, relative = config file dir)
 //!
 //! [[project]]                   # repeatable; default: one project at "."
 //! path = "apps/web"             # relative to the config file
@@ -18,7 +19,7 @@
 //! install = "npm ci --ignore-scripts"
 //! build = "npm run build"
 //! test = "npm test"
-//! timeout = "20m"               # per command
+//! timeout = "20m"               # per command; "0" = no timeout
 //!
 //! [[ignore]]
 //! id = "GHSA-xxxx-yyyy"         # matches the advisory id or any alias
@@ -88,7 +89,7 @@ pub struct ProjectConfig {
     pub install: Option<String>,
     pub build: Option<String>,
     pub test: Option<String>,
-    /// Per-command timeout. `None` = no timeout.
+    /// Per-command timeout. `None` = no timeout (also for `timeout = "0"`).
     pub timeout: Option<Duration>,
 }
 
@@ -126,7 +127,9 @@ pub struct IgnoreRule {
 pub struct SafetyConfig {
     /// Run builds even if safety checks fail (`--allow-unsandboxed`).
     pub allow_unsandboxed: bool,
-    /// Extra paths that must not be readable (`~/` is expanded).
+    /// Extra paths that must not be readable. `~` / `~/...` are expanded by
+    /// the safety check; other relative paths are joined onto the config
+    /// file's directory when the config is parsed.
     pub deny_paths: Vec<String>,
 }
 
@@ -224,7 +227,19 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
         "d" => 86_400,
         _ => bail!("invalid duration `{s}`: unit must be one of s, m, h, d"),
     };
-    Ok(Duration::from_secs(n * secs))
+    let total = n
+        .checked_mul(secs)
+        .with_context(|| format!("duration `{s}` is too large"))?;
+    Ok(Duration::from_secs(total))
+}
+
+/// `~` and `~/...` stay as they are (the safety check expands them against
+/// `HOME`); other relative paths are joined onto `base_dir`.
+fn resolve_deny_path(path: String, base_dir: &Path) -> String {
+    if path == "~" || path.starts_with("~/") || Path::new(&path).is_absolute() {
+        return path;
+    }
+    base_dir.join(&path).to_string_lossy().into_owned()
 }
 
 fn parse_expires(v: &toml::Value) -> Result<jiff::civil::Date> {
@@ -279,10 +294,12 @@ impl Config {
         }
         let mut projects = Vec::new();
         for p in raw.project {
+            // "0" means no timeout (not "kill at once").
             let timeout = match &p.timeout {
                 Some(t) => Some(
                     parse_duration(t).with_context(|| format!("project `{}`: timeout", p.path))?,
-                ),
+                )
+                .filter(|d| !d.is_zero()),
                 None => None,
             };
             projects.push(ProjectConfig {
@@ -315,7 +332,12 @@ impl Config {
             policy,
             safety: SafetyConfig {
                 allow_unsandboxed: raw.safety.allow_unsandboxed,
-                deny_paths: raw.safety.deny_paths,
+                deny_paths: raw
+                    .safety
+                    .deny_paths
+                    .into_iter()
+                    .map(|p| resolve_deny_path(p, base_dir))
+                    .collect(),
             },
             projects,
             ignores,
@@ -516,9 +538,43 @@ expires = "2027-01-02"
         assert_eq!(parse_duration("20m").unwrap(), Duration::from_secs(1200));
         assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
         assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
+        let err = parse_duration("18446744073709551615d").unwrap_err();
+        assert!(format!("{err:#}").contains("too large"), "{err:#}");
         for bad in ["", "d", "7", "7 d", "-1d", "1.5h", "7days", "1y"] {
             assert!(parse_duration(bad).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn zero_timeout_means_none() {
+        for zero in ["0", "0s", "0d"] {
+            let text = format!("[[project]]\ntimeout = \"{zero}\"\n");
+            let c = Config::parse(&text, Path::new("/r")).unwrap();
+            assert_eq!(c.projects[0].timeout, None, "{zero}");
+        }
+    }
+
+    #[test]
+    fn deny_paths_are_relative_to_the_config_file() {
+        let c = Config::parse(
+            r#"
+[safety]
+deny-paths = ["~", "~/.aws", "/etc/x", "secrets", "./a/b", "~x"]
+"#,
+            Path::new("/repo"),
+        )
+        .unwrap();
+        assert_eq!(
+            c.safety.deny_paths,
+            vec![
+                "~",
+                "~/.aws",
+                "/etc/x",
+                "/repo/secrets",
+                "/repo/./a/b",
+                "/repo/~x"
+            ]
+        );
     }
 
     #[test]

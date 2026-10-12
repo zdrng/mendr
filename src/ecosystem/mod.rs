@@ -222,6 +222,15 @@ pub trait Ecosystem {
     /// temporary directory (`["target"]`, `["node_modules"]`).
     fn copy_excludes(&self) -> &'static [&'static str];
 
+    /// File names (matched at any depth, e.g. every workspace member's
+    /// manifest) that `apply` may create, change or delete. Verification
+    /// snapshots, compares and restores only these around each change, and
+    /// `--write` copies back only these. Empty (the default) = any file,
+    /// which is correct but slow on big trees.
+    fn manifest_files(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     // ---- Registry --------------------------------------------------------------
 
     /// All published versions of `package` (any order, including yanked).

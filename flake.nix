@@ -33,6 +33,16 @@
         };
       });
 
+      packages = forAllSystems (pkgs: {
+        default = pkgs.rustPlatform.buildRustPackage {
+          pname = "mendr";
+          version = (pkgs.lib.importTOML ./Cargo.toml).package.version;
+          src = self;
+          cargoLock.lockFile = ./Cargo.lock;
+          meta.mainProgram = "mendr";
+        };
+      });
+
       formatter = forAllSystems (pkgs: pkgs.nixfmt-rfc-style);
     };
 }

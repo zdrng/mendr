@@ -103,11 +103,11 @@ target = "minimal"           # or "latest-compatible": highest fixed version wit
 
 [safety]
 allow-unsandboxed = false
-deny-paths = ["~/.aws", "/etc/secrets"]   # extra paths that must not be readable
+deny-paths = ["~/.aws", "/etc/secrets"]   # extra paths that must not be readable (`~/` = HOME)
 
 [[project]]                  # repeatable; default: one project at "."
 path = "services/api"        # ecosystem auto-detected
-timeout = "20m"              # per command; default: none
+timeout = "20m"              # per command; default and "0": no timeout
 
 [[project]]
 path = "apps/web"
@@ -117,7 +117,8 @@ build = "npm run build"
 test = "npm test"
 
 [[ignore]]
-id = "GHSA-xxxx-yyyy-zzzz"   # matches the advisory id or any alias (CVE, RUSTSEC, ...)
+id = "GHSA-xxxx-yyyy-zzzz"   # the advisory id or any alias (CVE, RUSTSEC, ...), any case;
+                             # mendr warns when it matches no advisory of the scanned packages
 reason = "not reachable: we never parse untrusted input"
 expires = 2026-12-31         # optional, inclusive (UTC); afterwards the advisory counts again
 ```
@@ -133,22 +134,43 @@ Default commands:
 ## Safety
 
 Verification runs untrusted code: build scripts, install scripts and test suites of new
-dependency versions. Before building anything, mendr looks for secrets that this code could read
-and refuses to run (exit 2) if it finds any:
+dependency versions. Before building anything for a project (only when it has changes to verify;
+never with `--plan-only`), mendr looks for secrets that this code could read and refuses to
+build that project (it reports a project error, exit 2) if it finds any:
 
-- credential files under `HOME` (SSH private keys, `~/.aws/credentials`, `~/.npmrc` and pnpm `rc` tokens,
-  `~/.cargo/credentials.toml`, `~/.docker/config.json` auths, `~/.config/gh/hosts.yml`,
-  `~/.netrc`, `~/.kube/config`, gcloud/Azure/GnuPG/PyPI/RubyGems credentials, ...) and files
-  named by variables such as `CARGO_HOME`, `DOCKER_CONFIG`, `KUBECONFIG`,
-  `GOOGLE_APPLICATION_CREDENTIALS`;
-- secret-looking environment variables (`*_TOKEN`, `*_SECRET`, `*PASSWORD`, `*_KEY`, ...;
-  values are never printed);
-- a reachable SSH agent (`SSH_AUTH_SOCK`) or Docker/Podman socket, or a non-unix `DOCKER_HOST`;
-- every readable path in `[safety] deny-paths`.
+- credential files under `HOME` (SSH private keys, also in subfolders of `~/.ssh`,
+  `~/.aws/credentials`, `~/.npmrc` and pnpm `rc` tokens, `~/.cargo/credentials.toml`,
+  `~/.docker/config.json` auths, `~/.config/gh/hosts.yml`, `~/.netrc`, `~/.git-credentials`,
+  `~/.config/git/credentials`, `~/.kube/config`, gcloud/Azure/GnuPG/PyPI/RubyGems credentials,
+  ...) and files named by variables such as `CARGO_HOME`, `DOCKER_CONFIG`, `KUBECONFIG`,
+  `XDG_CONFIG_HOME`, `GOOGLE_APPLICATION_CREDENTIALS`;
+- a Git credential helper (`credential.helper`, e.g. `osxkeychain`, which Apple's Git sets
+  system-wide) in the system or global Git config: a build can ask it for tokens with
+  `git credential fill`;
+- secret-looking environment variables (`*_TOKEN`, `*_SECRET`, `*PASSWORD`, `*_KEY`, ...) and
+  variables whose value holds a URL with a password (`scheme://user:pass@host`); values are
+  never printed;
+- an SSH agent (`SSH_AUTH_SOCK`) that holds at least one identity (or does not answer the
+  identity query; the empty agent macOS always provides is fine);
+- a reachable Docker/Podman socket (`/var/run/docker.sock`, `DOCKER_HOST`, rootless sockets,
+  Docker Desktop, OrbStack, Colima, Lima, Rancher Desktop and Podman machine sockets, unix
+  endpoints of Docker contexts), a non-unix `DOCKER_HOST` or Docker context endpoint;
+- every readable path in `[safety] deny-paths`;
+- in the project itself, because it is copied into the build's temp dir: an `.npmrc` with an
+  `_auth`/`_authToken`/`_password` value (a bare `${VAR}` counts only if `VAR` is set) or a
+  `.yarnrc.yml` with `npmAuth`, and `.env` / `.env.*` files (not `.example`, `.sample`,
+  `.template`).
 
 Run mendr where none of this is reachable (a container or CI job without secrets), use
 `--plan-only`, or accept the risk with `--allow-unsandboxed` (mendr then prints the list as a
 warning). The checks look for danger; they cannot prove isolation.
+
+The temp copy leaves out `.git` and every `node_modules`. Commands run in their own process
+group, which is killed when the command ends (no background process survives it). On Ctrl-C,
+`SIGTERM` or `SIGHUP` mendr stops the running command, removes the temp copy and exits with
+128 + the signal number (130, 143, 129); a second signal exits at once. `--write` refuses to
+touch the project if a file it would write changed since mendr copied it, and replaces files by
+renaming temp files written next to them.
 
 ## Output and exit codes
 
@@ -195,7 +217,11 @@ Limitations:
   [PLAN.md](PLAN.md)).
 
 OSV responses and registry metadata are cached under `$MENDR_CACHE_DIR`,
-`$XDG_CACHE_HOME/mendr` or `~/.cache/mendr`.
+`$XDG_CACHE_HOME/mendr` or `~/.cache/mendr` (empty variables are ignored; without `HOME`, a
+`mendr-<uid>` directory in the system temp directory). Entries unused for 30 days are deleted at
+startup. Failed requests (connection errors, timeouts, HTTP 408, 429 and 5xx) are retried three
+times with backoff. `MENDR_OSV_API` replaces the OSV API base URL (default
+`https://api.osv.dev/v1`), e.g. with a mirror.
 
 ## Development
 

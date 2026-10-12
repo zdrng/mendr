@@ -191,6 +191,10 @@ impl Ecosystem for Npm {
         &["node_modules"]
     }
 
+    fn manifest_files(&self) -> &'static [&'static str] {
+        &["package.json", "package-lock.json", "npm-shrinkwrap.json"]
+    }
+
     fn releases(&self, package: &str) -> Result<Vec<Release>, AdapterError> {
         Ok(self.info(package)?.releases.clone())
     }

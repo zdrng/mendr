@@ -19,13 +19,12 @@ and every attempt ends in a structured result with a reason.
 ## How a run works
 
 1. Load `mendr.toml`, apply CLI flag overrides.
-2. Run safety checks.
-3. For each project: detect the ecosystem, resolve the dependency graph, look up vulnerabilities in OSV.
-4. Plan: for each vulnerable package, pick the cheapest strategy the rules allow:
+2. For each project: detect the ecosystem, resolve the dependency graph, look up vulnerabilities in OSV.
+3. Plan: for each vulnerable package, pick the cheapest strategy the rules allow:
    `relock` → `direct bump` → `override` → give up with a reason.
-5. Unless `--plan-only`: copy the project, run a baseline build/test, then apply each change, build,
-   test, and keep or revert it.
-6. Print the report (JSON or Markdown).
+4. Unless `--plan-only` or nothing is planned: run the safety checks (host and project), copy the
+   project, run a baseline build/test, then apply each change, build, test, and keep or revert it.
+5. Print the report (JSON or Markdown).
 
 ## Module layout
 

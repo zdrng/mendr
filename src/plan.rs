@@ -33,11 +33,14 @@
 //!    `no_parent_version_fixes` (direct bump was tried), else
 //!    `strategy_unsupported`, else `no_parent_version_fixes`.
 //! 6. Merges changes: same `(package, from)` relocks/bumps collapse into one
-//!    change with the highest `to` (a bump wins over a relock); same for
-//!    overrides. Findings point at the merged change. A merged bump/override
-//!    that became major without `allow-major` -> `skipped:major_bump_blocked`.
+//!    change (a bump wins over a relock) with the highest `to` if it still
+//!    fixes every merged finding, else the lower one; a change that fits
+//!    neither stays separate. Same for overrides. Findings point at the
+//!    merged change. A merged bump/override that became major without
+//!    `allow-major` -> `skipped:major_bump_blocked`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -45,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{IgnoreRule, Policy, TargetPolicy};
 use crate::ecosystem::{AdapterError, DeclaredDep, Ecosystem, Release};
 use crate::model::{
-    BumpKind, Change, DepGraph, NodeId, Outcome, SkipReason, Strategy, Version, VersionReq,
+    BumpKind, Change, DepGraph, Node, NodeId, Outcome, SkipReason, Strategy, Version, VersionReq,
 };
 use crate::osv::{self, Advisory, Severity};
 use crate::rules::{self, IgnoreMatch};
@@ -104,7 +107,8 @@ pub struct Finding {
 /// Planner output for one project.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProjectPlan {
-    /// Sorted by (package, version, advisory id, via).
+    /// Sorted by (package, version, advisory id, via); versions in the
+    /// ecosystem's order.
     pub findings: Vec<Finding>,
     /// Distinct merged changes, in order of first use.
     pub changes: Vec<Change>,
@@ -123,29 +127,23 @@ pub struct PlanInput<'a> {
 /// Plan fixes for one project. Never fails: registry errors become
 /// `failed:error` outcomes on the affected findings.
 pub fn plan(input: &PlanInput) -> ProjectPlan {
-    let mut planner = Planner {
-        input,
-        releases: HashMap::new(),
-        deps: HashMap::new(),
-    };
+    let eco = input.eco;
+    let mut planner = Planner::new(input);
     let mut findings = planner.findings();
-    findings.sort_by(|a, b| {
-        (
-            &a.package,
-            a.version.as_str(),
-            &a.advisory.id,
-            &a.via.name,
-            a.via.version.as_str(),
-        )
-            .cmp(&(
-                &b.package,
-                b.version.as_str(),
-                &b.advisory.id,
-                &b.via.name,
-                b.via.version.as_str(),
-            ))
+    findings.sort_by(|(a, _), (b, _)| {
+        a.package
+            .cmp(&b.package)
+            .then_with(|| eco.compare(&a.version, &b.version))
+            .then_with(|| a.advisory.id.cmp(&b.advisory.id))
+            .then_with(|| a.via.name.cmp(&b.via.name))
+            .then_with(|| eco.compare(&a.via.version, &b.via.version))
     });
-    let changes = merge(input.eco, input.policy, &mut findings);
+    let (mut findings, goals): (Vec<Finding>, Vec<Option<Goal>>) = findings.into_iter().unzip();
+    let changes = merge(eco, input.policy, &mut findings, &mut |i, change| {
+        goals[i]
+            .as_ref()
+            .is_some_and(|goal| planner.fixes(goal, change.package(), change.to()))
+    });
     ProjectPlan { findings, changes }
 }
 
@@ -159,8 +157,20 @@ struct Group {
     /// inside this group, or of all its parents with `shared_copies`.
     parent_reqs: Vec<VersionReq>,
     /// Names of registry packages between `via` and `P` (exclusive).
-    corridor: HashSet<String>,
+    corridor: BTreeSet<String>,
     paths: Vec<Vec<String>>,
+}
+
+/// What a planned change must achieve for its finding; a merged change is
+/// re-checked against it (see [`Planner::fixes`]).
+struct Goal {
+    /// The vulnerable package.
+    target: String,
+    /// The finding's group corridor (for a bump of its via).
+    corridor: BTreeSet<String>,
+    /// Requirements the new version must satisfy (a relock's parent
+    /// requirements; empty otherwise).
+    reqs: Vec<VersionReq>,
 }
 
 /// How one candidate version fares in [`Planner::select`].
@@ -177,26 +187,87 @@ enum Verdict {
 struct Target<'b> {
     name: &'b str,
     advisories: Vec<&'b Advisory>,
-    releases: Vec<Release>,
+}
+
+/// Settled [`Planner::subtree_ok`] answers per `(package, version)`, with
+/// the smallest depth each may be reused at (see [`Subtree::cut`]).
+type Memo = HashMap<(String, Version), (bool, usize)>;
+
+/// Answer of [`Planner::subtree_ok`] for one node.
+#[derive(Clone, Copy)]
+struct Subtree {
+    ok: bool,
+    /// Smallest depth of an in-progress node assumed fine (`usize::MAX` if
+    /// none).
+    assumed: usize,
+    /// Whether a depth cut assumed something fine. Such an answer is reused
+    /// only at the depth it was computed at or deeper, where a fresh walk
+    /// would not look further.
+    cut: bool,
+}
+
+impl Subtree {
+    const OK: Subtree = Subtree {
+        ok: true,
+        assumed: usize::MAX,
+        cut: false,
+    };
+    const FAIL: Subtree = Subtree {
+        ok: false,
+        ..Self::OK
+    };
+}
+
+/// State of the [`Planner::subtree_ok`] walks for one target and corridor.
+struct Walk<'w> {
+    target: &'w Target<'w>,
+    corridor: &'w BTreeSet<String>,
+    memo: Memo,
+    /// Nodes being evaluated, with their depth.
+    stack: HashMap<(String, Version), usize>,
 }
 
 struct Planner<'a> {
     input: &'a PlanInput<'a>,
-    releases: HashMap<String, Vec<Release>>,
-    deps: HashMap<(String, Version), Vec<DeclaredDep>>,
+    releases: HashMap<String, Rc<[Release]>>,
+    deps: HashMap<(String, Version), Rc<[DeclaredDep]>>,
+    /// What a fresh resolution picks per `(package, requirement)`.
+    picks: HashMap<(String, VersionReq), Option<Version>>,
+    /// `(parent, dependency)` names of the graph's edges.
+    edge_names: HashSet<(&'a str, &'a str)>,
+    /// Subtree results per target package and corridor (they depend on
+    /// nothing else), kept across groups and findings.
+    memos: HashMap<String, Vec<(BTreeSet<String>, Memo)>>,
 }
 
 impl<'a> Planner<'a> {
+    fn new(input: &'a PlanInput<'a>) -> Self {
+        let g = input.graph;
+        let edge_names = g
+            .edges
+            .iter()
+            .map(|e| (g.node(e.from).name.as_str(), g.node(e.to).name.as_str()))
+            .collect();
+        Planner {
+            input,
+            releases: HashMap::new(),
+            deps: HashMap::new(),
+            picks: HashMap::new(),
+            edge_names,
+            memos: HashMap::new(),
+        }
+    }
+
     fn eco(&self) -> &'a dyn Ecosystem {
         self.input.eco
     }
 
-    fn releases(&mut self, package: &str) -> Result<Vec<Release>, AdapterError> {
+    fn releases(&mut self, package: &str) -> Result<Rc<[Release]>, AdapterError> {
         if let Some(r) = self.releases.get(package) {
-            return Ok(r.clone());
+            return Ok(Rc::clone(r));
         }
-        let r = self.eco().releases(package)?;
-        self.releases.insert(package.to_string(), r.clone());
+        let r: Rc<[Release]> = self.eco().releases(package)?.into();
+        self.releases.insert(package.to_string(), Rc::clone(&r));
         Ok(r)
     }
 
@@ -204,14 +275,33 @@ impl<'a> Planner<'a> {
         &mut self,
         package: &str,
         version: &Version,
-    ) -> Result<Vec<DeclaredDep>, AdapterError> {
+    ) -> Result<Rc<[DeclaredDep]>, AdapterError> {
         let key = (package.to_string(), version.clone());
         if let Some(d) = self.deps.get(&key) {
-            return Ok(d.clone());
+            return Ok(Rc::clone(d));
         }
-        let d = self.eco().dependencies_of(package, version)?;
-        self.deps.insert(key, d.clone());
+        let d: Rc<[DeclaredDep]> = self.eco().dependencies_of(package, version)?.into();
+        self.deps.insert(key, Rc::clone(&d));
         Ok(d)
+    }
+
+    /// The version a fresh resolution picks for `package` under `req`: the
+    /// highest non-yanked release that satisfies it (prereleases only where
+    /// the ecosystem's `satisfies` allows them).
+    fn pick(&mut self, package: &str, req: &VersionReq) -> Result<Option<Version>, AdapterError> {
+        let key = (package.to_string(), req.clone());
+        if let Some(v) = self.picks.get(&key) {
+            return Ok(v.clone());
+        }
+        let eco = self.eco();
+        let picked = self
+            .releases(package)?
+            .iter()
+            .filter(|r| !r.yanked && eco.satisfies(req, &r.version))
+            .max_by(|a, b| eco.compare(&a.version, &b.version))
+            .map(|r| r.version.clone());
+        self.picks.insert(key, picked.clone());
+        Ok(picked)
     }
 
     /// Non-yanked releases newer than `current`, sorted ascending.
@@ -246,8 +336,27 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// Policy verdict for moving `node` to `c` by a manifest bump or an
+    /// override: a major bump needs `allow-major`, and `c` must pass
+    /// `min-release-age`.
+    fn move_verdict(&self, node: &Node, c: &Release) -> Verdict {
+        let bump = self.eco().bump_kind(&node.version, &c.version);
+        if !rules::bump_allowed(bump, self.input.policy) {
+            Verdict::Stop(SkipReason::MajorBumpBlocked {
+                package: node.name.clone(),
+                from: node.version.clone(),
+                to: c.version.clone(),
+            })
+        } else if !self.age_ok(c) {
+            Verdict::Blocked(self.too_recent(&node.name, c))
+        } else {
+            Verdict::Accept
+        }
+    }
+
     /// Walk ascending `cands`; return the accepted version per target policy,
-    /// or the first policy block met (if any).
+    /// or the first policy block met (if any). Once a version is chosen,
+    /// blocks no longer matter (`Stop` still ends the walk).
     fn select(
         &mut self,
         cands: &[Release],
@@ -256,16 +365,11 @@ impl<'a> Planner<'a> {
         let mut blocked = None;
         let mut chosen: Option<Release> = None;
         for c in cands {
-            if let Some(min) = &chosen {
-                if self.input.policy.target == TargetPolicy::Minimal
-                    || self.eco().bump_kind(&min.version, &c.version) == BumpKind::Major
-                {
-                    break;
-                }
-                if let Verdict::Accept = verdict(self, c)? {
-                    chosen = Some(c.clone());
-                }
-                continue;
+            if let Some(min) = &chosen
+                && (self.input.policy.target == TargetPolicy::Minimal
+                    || self.eco().bump_kind(&min.version, &c.version) == BumpKind::Major)
+            {
+                break;
             }
             match verdict(self, c)? {
                 Verdict::Accept => chosen = Some(c.clone()),
@@ -317,7 +421,8 @@ impl<'a> Planner<'a> {
             .collect()
     }
 
-    fn findings(&mut self) -> Vec<Finding> {
+    /// Unsorted findings, each with the [`Goal`] of its change (if any).
+    fn findings(&mut self) -> Vec<(Finding, Option<Goal>)> {
         let input = self.input;
         let mut out = Vec::new();
         for vn in osv::vulnerabilities_for(input.graph, input.eco, input.advisories) {
@@ -377,27 +482,35 @@ impl<'a> Planner<'a> {
                     change,
                     outcome,
                 };
+                let goal = |change: &Change| Goal {
+                    target: node.name.clone(),
+                    corridor: g.corridor.clone(),
+                    reqs: match change {
+                        Change::Relock { .. } => g.parent_reqs.clone(),
+                        _ => Vec::new(),
+                    },
+                };
                 for adv in &active {
                     out.push(match &decisions[gi] {
-                        Ok(change) => finding(
-                            adv,
-                            Some(change.clone()),
-                            Outcome::Planned {
-                                strategy: change.strategy(),
-                                change: change.clone(),
-                            },
+                        Ok(change) => (
+                            finding(
+                                adv,
+                                Some(change.clone()),
+                                Outcome::Planned {
+                                    strategy: change.strategy(),
+                                    change: change.clone(),
+                                },
+                            ),
+                            Some(goal(change)),
                         ),
-                        Err(outcome) => finding(adv, None, outcome.clone()),
+                        Err(outcome) => (finding(adv, None, outcome.clone()), None),
                     });
                 }
                 for (adv, reason) in &skipped {
-                    out.push(finding(
-                        adv,
-                        None,
-                        Outcome::Skipped {
-                            reason: reason.clone(),
-                        },
-                    ));
+                    let outcome = Outcome::Skipped {
+                        reason: reason.clone(),
+                    };
+                    out.push((finding(adv, None, outcome), None));
                 }
             }
         }
@@ -415,10 +528,9 @@ impl<'a> Planner<'a> {
         let target = Target {
             name: package,
             advisories: self.active_advisories(package),
-            releases,
         };
         let cands = self
-            .newer(&target.releases, current)
+            .newer(&releases, current)
             .into_iter()
             .filter(|r| target.is_safe(self.eco(), &r.version))
             .collect();
@@ -453,7 +565,7 @@ impl<'a> Planner<'a> {
                     .map(|e| e.req.clone())
                     .collect();
                 let corridor = if via == p {
-                    HashSet::new()
+                    BTreeSet::new()
                 } else {
                     reach
                         .intersection(&reaching_p)
@@ -462,13 +574,19 @@ impl<'a> Planner<'a> {
                         .collect()
                 };
                 // Paths whose first registry package is `via`: local nodes
-                // that lead to `via`, then anything.
-                let reaching_via = g.reaching(via);
+                // that lead to `via` through local nodes only, then anything.
+                let mut locals_to_via = HashSet::new();
+                let mut stack = vec![via];
+                while let Some(n) = stack.pop() {
+                    for e in g.edges_to(n) {
+                        if is_local(e.from) && locals_to_via.insert(e.from) {
+                            stack.push(e.from);
+                        }
+                    }
+                }
                 let paths = g
-                    .paths_to(p, MAX_PATHS, &|path, next| {
-                        next == via
-                            || path.contains(&via)
-                            || (is_local(next) && reaching_via.contains(&next))
+                    .paths_to(p, &reaching_p, MAX_PATHS, &|path, next| {
+                        next == via || path.contains(&via) || locals_to_via.contains(&next)
                     })
                     .iter()
                     .map(|path| path.iter().map(|&id| g.label(id)).collect())
@@ -513,13 +631,15 @@ impl<'a> Planner<'a> {
             let result = match strategy {
                 Strategy::Relock => {
                     let reqs = &group.parent_reqs;
-                    let allowed: Vec<Release> = cands
-                        .iter()
-                        .filter(|c| {
-                            !reqs.is_empty() && reqs.iter().all(|r| eco.satisfies(r, &c.version))
-                        })
-                        .cloned()
-                        .collect();
+                    let allowed: Vec<Release> = if reqs.is_empty() {
+                        Vec::new()
+                    } else {
+                        cands
+                            .iter()
+                            .filter(|c| reqs.iter().all(|r| eco.satisfies(r, &c.version)))
+                            .cloned()
+                            .collect()
+                    };
                     self.select(&allowed, |s, c| {
                         Ok(if s.age_ok(c) {
                             Verdict::Accept
@@ -536,46 +656,30 @@ impl<'a> Planner<'a> {
                 }
                 Strategy::DirectBump => {
                     let via = self.input.graph.node(group.via);
-                    let via_cands = if group.via == p {
-                        cands.to_vec()
+                    let res = if group.via == p {
+                        // `cands` are already safe from every advisory for `p`.
+                        self.select(cands, |s, c| Ok(s.move_verdict(via, c)))
                     } else {
                         let rel = self.releases(&via.name).map_err(fail)?;
-                        let mut newer = self.newer(&rel, &via.version);
-                        newer.truncate(MAX_CANDIDATES);
-                        newer
-                    };
-                    // The new version of the via must not be vulnerable itself.
-                    let via_advisories = self.active_advisories(&via.name);
-                    let mut memo = HashMap::new();
-                    let res = self
-                        .select(&via_cands, |s, c| {
+                        let mut via_cands = self.newer(&rel, &via.version);
+                        via_cands.truncate(MAX_CANDIDATES);
+                        // The new version of the via must not be vulnerable itself.
+                        let via_advisories = self.active_advisories(&via.name);
+                        let mut walk = self.walk(target, &group.corridor);
+                        let res = self.select(&via_cands, |s, c| {
                             if via_advisories
                                 .iter()
                                 .any(|a| a.affects(eco, &via.name, &c.version))
+                                || !s.subtree_ok(&via.name, &c.version, &mut walk, 0)?.ok
                             {
                                 return Ok(Verdict::Reject);
                             }
-                            if group.via != p
-                                && !s.subtree_ok(
-                                    &via.name, &c.version, group, target, 0, &mut memo,
-                                )?
-                            {
-                                return Ok(Verdict::Reject);
-                            }
-                            let bump = eco.bump_kind(&via.version, &c.version);
-                            Ok(if !rules::bump_allowed(bump, policy) {
-                                Verdict::Stop(SkipReason::MajorBumpBlocked {
-                                    package: via.name.clone(),
-                                    from: via.version.clone(),
-                                    to: c.version.clone(),
-                                })
-                            } else if !s.age_ok(c) {
-                                Verdict::Blocked(s.too_recent(&via.name, c))
-                            } else {
-                                Verdict::Accept
-                            })
-                        })
-                        .map_err(fail)?;
+                            Ok(s.move_verdict(via, c))
+                        });
+                        self.store(walk);
+                        res
+                    }
+                    .map_err(fail)?;
                     if matches!(res, Err(None)) {
                         bump_reason = Some(SkipReason::NoParentVersionFixes {
                             package: via.name.clone(),
@@ -590,20 +694,7 @@ impl<'a> Planner<'a> {
                     })
                 }
                 Strategy::Override => self
-                    .select(cands, |s, c| {
-                        let bump = eco.bump_kind(&node.version, &c.version);
-                        Ok(if !rules::bump_allowed(bump, policy) {
-                            Verdict::Stop(SkipReason::MajorBumpBlocked {
-                                package: node.name.clone(),
-                                from: node.version.clone(),
-                                to: c.version.clone(),
-                            })
-                        } else if !s.age_ok(c) {
-                            Verdict::Blocked(s.too_recent(&node.name, c))
-                        } else {
-                            Verdict::Accept
-                        })
-                    })
+                    .select(cands, |s, c| Ok(s.move_verdict(node, c)))
                     .map_err(fail)?
                     .map(|r| Change::Override {
                         package: node.name.clone(),
@@ -631,65 +722,139 @@ impl<'a> Planner<'a> {
         Err(Outcome::Skipped { reason })
     }
 
+    /// Whether moving `package` to `to` still fixes the finding `goal`
+    /// belongs to: a move of the vulnerable package itself must land on a
+    /// safe version, a bump of its via on a version that is not vulnerable
+    /// itself and whose subtree resolves to a safe target.
+    fn fixes(&mut self, goal: &Goal, package: &str, to: &Version) -> bool {
+        let eco = self.eco();
+        if !goal.reqs.iter().all(|r| eco.satisfies(r, to)) {
+            return false;
+        }
+        let target = Target {
+            name: &goal.target,
+            advisories: self.active_advisories(&goal.target),
+        };
+        if package == goal.target {
+            return target.is_safe(eco, to);
+        }
+        if self
+            .active_advisories(package)
+            .iter()
+            .any(|a| a.affects(eco, package, to))
+        {
+            return false;
+        }
+        let mut walk = self.walk(&target, &goal.corridor);
+        let answer = self.subtree_ok(package, to, &mut walk, 0);
+        self.store(walk);
+        answer.is_ok_and(|a| a.ok)
+    }
+
+    /// Start walks for `target` through `corridor`, with the results
+    /// settled by earlier walks.
+    fn walk<'w>(&mut self, target: &'w Target<'w>, corridor: &'w BTreeSet<String>) -> Walk<'w> {
+        let memo = self
+            .memos
+            .get_mut(target.name)
+            .and_then(|m| m.iter_mut().find(|(c, _)| c == corridor))
+            .map(|(_, memo)| std::mem::take(memo))
+            .unwrap_or_default();
+        Walk {
+            target,
+            corridor,
+            memo,
+            stack: HashMap::new(),
+        }
+    }
+
+    /// Keep the settled results of `walk` for later walks.
+    fn store(&mut self, walk: Walk) {
+        let memos = self.memos.entry(walk.target.name.to_string()).or_default();
+        match memos.iter_mut().find(|(c, _)| c == walk.corridor) {
+            Some((_, memo)) => *memo = walk.memo,
+            None => memos.push((walk.corridor.clone(), walk.memo)),
+        }
+    }
+
     /// Whether `package@version` (a candidate version of the group's direct
     /// dependency, or a package below it) can resolve to a non-vulnerable
     /// target package.
     ///
     /// Only dependencies that lead to the target in the current graph (the
-    /// group's corridor) are followed, each resolved to its highest
-    /// non-yanked matching version (what a fresh resolution picks). A direct
-    /// requirement on the target is fine if it allows any safe release. New
-    /// paths a candidate introduces are not explored; verification rescans.
+    /// walk's corridor) are followed, each resolved to what a fresh
+    /// resolution picks ([`Planner::pick`]); a requirement on the target
+    /// itself must pick a safe release. Optional dependencies count only if
+    /// the current graph already has them (an edge between the same names).
+    /// New paths a candidate introduces are not explored; verification
+    /// rescans.
+    ///
+    /// Cycles and subtrees below [`MAX_DEPTH`] are assumed fine. A failure
+    /// is final; a success that assumed an in-progress node fine is only
+    /// memoized once that node is settled.
     fn subtree_ok(
         &mut self,
         package: &str,
         version: &Version,
-        group: &Group,
-        target: &Target,
+        walk: &mut Walk,
         depth: usize,
-        memo: &mut HashMap<(String, Version), bool>,
-    ) -> Result<bool, AdapterError> {
+    ) -> Result<Subtree, AdapterError> {
         let key = (package.to_string(), version.clone());
-        if let Some(&ok) = memo.get(&key) {
-            return Ok(ok);
+        if let Some(&(ok, from)) = walk.memo.get(&key)
+            && depth >= from
+        {
+            return Ok(Subtree {
+                cut: from > 0,
+                ..if ok { Subtree::OK } else { Subtree::FAIL }
+            });
         }
-        memo.insert(key.clone(), true); // cycle guard
+        if let Some(&d) = walk.stack.get(&key) {
+            // A cycle: fine as far as this node is concerned.
+            return Ok(Subtree {
+                assumed: d,
+                ..Subtree::OK
+            });
+        }
+        walk.stack.insert(key.clone(), depth);
         let eco = self.eco();
-        let mut ok = true;
-        for dep in self.dependencies_of(package, version)? {
-            if dep.name == target.name {
-                let fixable = target.releases.iter().any(|r| {
-                    !r.yanked
-                        && eco.satisfies(&dep.req, &r.version)
-                        && target.is_safe(eco, &r.version)
-                });
-                if !fixable {
-                    ok = false;
-                    break;
-                }
-            } else if group.corridor.contains(&dep.name) && depth < MAX_DEPTH {
-                let rel = self.releases(&dep.name)?;
-                let chosen = rel
-                    .iter()
-                    .filter(|r| {
-                        !r.yanked
-                            && !eco.is_prerelease(&r.version)
-                            && eco.satisfies(&dep.req, &r.version)
-                    })
-                    .max_by(|a, b| eco.compare(&a.version, &b.version))
-                    .map(|r| r.version.clone());
-                let sub_ok = match chosen {
-                    Some(v) => self.subtree_ok(&dep.name, &v, group, target, depth + 1, memo)?,
-                    None => false,
-                };
-                if !sub_ok {
-                    ok = false;
-                    break;
-                }
+        let mut answer = Subtree::OK;
+        for dep in self.dependencies_of(package, version)?.iter() {
+            if dep.optional && !self.edge_names.contains(&(package, dep.name.as_str())) {
+                continue;
             }
+            let sub = if dep.name == walk.target.name {
+                let picked = self.pick(&dep.name, &dep.req)?;
+                if picked.is_some_and(|v| walk.target.is_safe(eco, &v)) {
+                    Subtree::OK
+                } else {
+                    Subtree::FAIL
+                }
+            } else if !walk.corridor.contains(&dep.name) {
+                continue;
+            } else if depth >= MAX_DEPTH {
+                Subtree {
+                    cut: true,
+                    ..Subtree::OK
+                }
+            } else {
+                match self.pick(&dep.name, &dep.req)? {
+                    Some(v) => self.subtree_ok(&dep.name, &v, walk, depth + 1)?,
+                    None => Subtree::FAIL,
+                }
+            };
+            if !sub.ok {
+                answer = Subtree::FAIL;
+                break;
+            }
+            answer.assumed = answer.assumed.min(sub.assumed);
+            answer.cut |= sub.cut;
         }
-        memo.insert(key, ok);
-        Ok(ok)
+        walk.stack.remove(&key);
+        if answer.assumed >= depth {
+            let from = if answer.cut { depth } else { 0 };
+            walk.memo.insert(key, (answer.ok, from));
+        }
+        Ok(answer)
     }
 }
 
@@ -703,33 +868,53 @@ impl Target<'_> {
 }
 
 /// Merge planned changes (see module docs) and rewrite findings to point at
-/// the merged change. Returns the distinct changes in order of first use.
-fn merge(eco: &dyn Ecosystem, policy: &Policy, findings: &mut [Finding]) -> Vec<Change> {
-    // key: (is_override, package, from)
-    let mut merged: Vec<((bool, String, Version), Change)> = Vec::new();
-    for f in findings.iter() {
+/// the merged change. `fixes(i, change)` tells whether `change` still fixes
+/// finding `i`. Returns the distinct changes in order of first use.
+fn merge(
+    eco: &dyn Ecosystem,
+    policy: &Policy,
+    findings: &mut [Finding],
+    fixes: &mut dyn FnMut(usize, &Change) -> bool,
+) -> Vec<Change> {
+    // (is_override, package, from) -> first merged change with that key
+    let mut by_key: HashMap<(bool, String, Version), usize> = HashMap::new();
+    // Merged changes with the findings they fix.
+    let mut merged: Vec<(Change, Vec<usize>)> = Vec::new();
+    let mut merged_into: Vec<Option<usize>> = vec![None; findings.len()];
+    for (i, f) in findings.iter().enumerate() {
         let Some(change) = &f.change else { continue };
         let key = (
             matches!(change, Change::Override { .. }),
             change.package().to_string(),
             change.from().clone(),
         );
-        match merged.iter_mut().find(|(k, _)| *k == key) {
-            None => merged.push((key, change.clone())),
-            Some((_, existing)) => *existing = combine(eco, existing, change),
+        if let Some(&m) = by_key.get(&key) {
+            let (existing, members) = &merged[m];
+            let (low, high) = if eco.compare(existing.to(), change.to()).is_ge() {
+                (change.to(), existing.to())
+            } else {
+                (existing.to(), change.to())
+            };
+            // The higher version, else the lower one, if it fixes them all.
+            let fixing = [high, low]
+                .map(|to| combine(eco, existing, change, to.clone()))
+                .into_iter()
+                .find(|c| members.iter().chain([&i]).all(|&j| fixes(j, c)));
+            if let Some(c) = fixing {
+                merged[m].0 = c;
+                merged[m].1.push(i);
+                merged_into[i] = Some(m);
+                continue;
+            }
         }
+        // The first change with this key, or one that cannot be merged.
+        by_key.entry(key).or_insert(merged.len());
+        merged_into[i] = Some(merged.len());
+        merged.push((change.clone(), vec![i]));
     }
-    for f in findings.iter_mut() {
-        let Some(change) = &f.change else { continue };
-        let key = (
-            matches!(change, Change::Override { .. }),
-            change.package().to_string(),
-            change.from().clone(),
-        );
-        let (_, m) = merged
-            .iter()
-            .find(|(k, _)| *k == key)
-            .expect("merged above");
+    for (f, m) in findings.iter_mut().zip(&merged_into) {
+        let Some(m) = m else { continue };
+        let m = &merged[*m].0;
         if major_blocked(eco, policy, m) {
             f.strategy = None;
             f.change = None;
@@ -751,11 +936,13 @@ fn merge(eco: &dyn Ecosystem, policy: &Policy, findings: &mut [Finding]) -> Vec<
             };
         }
     }
-    merged
-        .into_iter()
-        .map(|(_, c)| c)
-        .filter(|c| !major_blocked(eco, policy, c))
-        .collect()
+    let mut changes = Vec::new();
+    for (c, _) in merged {
+        if !major_blocked(eco, policy, &c) && !changes.contains(&c) {
+            changes.push(c);
+        }
+    }
+    changes
 }
 
 /// A merged bump or override can be major although each part was not (a
@@ -766,17 +953,18 @@ fn major_blocked(eco: &dyn Ecosystem, policy: &Policy, c: &Change) -> bool {
         && !rules::bump_allowed(eco.bump_kind(c.from(), c.to()), policy)
 }
 
-fn combine(eco: &dyn Ecosystem, a: &Change, b: &Change) -> Change {
-    let to = if eco.compare(a.to(), b.to()).is_ge() {
-        a.to()
-    } else {
-        b.to()
-    }
-    .clone();
+/// `a` merged with `b` (same package and `from`) as one change to `to`: a
+/// bump wins over a relock; overrides only merge with overrides.
+fn combine(eco: &dyn Ecosystem, a: &Change, b: &Change, to: Version) -> Change {
     let package = a.package().to_string();
     let from = a.from().clone();
     match (a, b) {
-        (Change::Override { .. }, _) => Change::Override { package, from, to },
+        (Change::Override { .. }, Change::Override { .. }) => {
+            Change::Override { package, from, to }
+        }
+        (Change::Override { .. }, _) | (_, Change::Override { .. }) => {
+            unreachable!("overrides are merged only with overrides")
+        }
         (Change::Relock { .. }, Change::Relock { .. }) => Change::Relock { package, from, to },
         _ => Change::DirectBump {
             bump: eco.bump_kind(&from, &to),
@@ -1239,7 +1427,7 @@ mod tests {
             to: v("1.0.0"),
             bump: BumpKind::Patch,
         };
-        let c = combine(&f, &relock, &bump);
+        let c = combine(&f, &relock, &bump, v("1.0.1"));
         assert_eq!(
             c,
             Change::DirectBump {
@@ -1486,7 +1674,7 @@ mod tests {
         };
         let f = Fake::new();
         let mut blocked = findings();
-        assert!(merge(&f, &policy(), &mut blocked).is_empty());
+        assert!(merge(&f, &policy(), &mut blocked, &mut |_, _| true).is_empty());
         for finding in &blocked {
             assert_eq!(
                 skip_reason(finding),
@@ -1502,7 +1690,7 @@ mod tests {
         let mut pol = policy();
         pol.allow_major = true;
         assert_eq!(
-            merge(&f, &pol, &mut findings()),
+            merge(&f, &pol, &mut findings(), &mut |_, _| true),
             vec![Change::DirectBump {
                 package: "p".into(),
                 from: v("1.0.0"),
@@ -1536,5 +1724,378 @@ mod tests {
             plan.findings[1].paths,
             vec![vec!["app@0.1.0", "b@1.0.0", "p@1.0.0"]]
         );
+    }
+
+    fn no_parent_fix(package: &str, vulnerable: &str) -> SkipReason {
+        SkipReason::NoParentVersionFixes {
+            package: package.into(),
+            vulnerable: vulnerable.into(),
+        }
+    }
+
+    /// Adds `names` as a chain of registry packages below `from` (each
+    /// `1.0.0`, declared `^1`, published with the next one as dependency and
+    /// `last` at the end). Returns the last node of the chain.
+    fn chain(f: &mut Fake, from: NodeId, names: &[String], last: (&str, &str)) -> NodeId {
+        let mut prev = from;
+        for (i, name) in names.iter().enumerate() {
+            prev = f.dep(prev, name, "1.0.0", "^1");
+            let next = names.get(i + 1).map_or(last, |n| (n.as_str(), "^1"));
+            f.publish(name, "1.0.0", &[next]);
+        }
+        prev
+    }
+
+    #[test]
+    fn cycle_results_are_settled_before_reuse() {
+        // root -> a -> b -> c -> p, and c -> b. b pins p.
+        let mut f = Fake::new();
+        let root = f.root("app", "0.1.0");
+        let a = f.dep(root, "a", "1.0.0", "^1");
+        let b = f.dep(a, "b", "1.0.0", "=1.0.0");
+        let c = f.dep(b, "c", "1.0.0", "^1");
+        let p = f.dep(c, "p", "1.0.0", "^1");
+        f.graph.add_edge(c, b, VersionReq::new("^1"));
+        f.graph.add_edge(b, p, VersionReq::new("=1.0.0"));
+        f.publish("a", "1.0.0", &[("b", "=1.0.0")]);
+        f.publish("a", "1.1.0", &[("b", "^1")]);
+        f.publish("a", "1.2.0", &[("c", "^1")]); // c -> b still pins p
+        f.publish("b", "1.0.0", &[("c", "^1"), ("p", "=1.0.0")]);
+        f.publish("c", "1.0.0", &[("b", "^1"), ("p", "^1")]);
+        f.publish("p", "1.0.0", &[]).publish("p", "1.0.1", &[]);
+        f.unsupported = vec![Strategy::Override];
+        let plan = run(&f, &[adv("A-1", "p", "0", "1.0.1")], &policy());
+        assert_eq!(skip_reason(only(&plan)), &no_parent_fix("a", "p"));
+    }
+
+    #[test]
+    fn depth_cut_results_are_not_reused_closer_to_the_root() {
+        // root -> a -> c1 .. c7 -> x -> y -> p; y pins p. Walking a@1.1.0
+        // reaches x at MAX_DEPTH (y unexplored), a@1.2.0 reaches x at depth 1.
+        let mut f = Fake::new();
+        let root = f.root("app", "0.1.0");
+        let a = f.dep(root, "a", "1.0.0", "^1");
+        let names: Vec<String> = (1..MAX_DEPTH).map(|i| format!("c{i}")).collect();
+        let last = chain(&mut f, a, &names, ("x", "^1"));
+        let y = chain(&mut f, last, &["x".into(), "y".into()], ("p", "=1.0.0"));
+        f.dep(y, "p", "1.0.0", "=1.0.0");
+        f.publish("a", "1.0.0", &[("c1", "^1")]);
+        f.publish("a", "1.1.0", &[("c1", "^1"), ("p", "=1.0.0")]);
+        f.publish("a", "1.2.0", &[("x", "^1")]);
+        f.publish("p", "1.0.0", &[]).publish("p", "1.0.1", &[]);
+        f.unsupported = vec![Strategy::Override];
+        let plan = run(&f, &[adv("A-1", "p", "0", "1.0.1")], &policy());
+        assert_eq!(skip_reason(only(&plan)), &no_parent_fix("a", "p"));
+    }
+
+    #[test]
+    fn subtree_walk_stops_at_max_depth() {
+        // root -> a -> c1 .. cN -> y -> p; y pins p. a@1.1.0 changes nothing:
+        // the pin is seen only if y is at most MAX_DEPTH below a.
+        for (len, expected) in [
+            (MAX_DEPTH - 1, "skipped:no_parent_version_fixes"),
+            (MAX_DEPTH, "planned"),
+        ] {
+            let mut f = Fake::new();
+            let root = f.root("app", "0.1.0");
+            let a = f.dep(root, "a", "1.0.0", "^1");
+            let names: Vec<String> = (1..=len).map(|i| format!("c{i}")).collect();
+            let last = chain(&mut f, a, &names, ("y", "^1"));
+            let y = chain(&mut f, last, &["y".into()], ("p", "=1.0.0"));
+            f.dep(y, "p", "1.0.0", "=1.0.0");
+            f.publish("a", "1.0.0", &[("c1", "^1")]);
+            f.publish("a", "1.1.0", &[("c1", "^1")]);
+            f.publish("p", "1.0.0", &[]).publish("p", "1.0.1", &[]);
+            f.unsupported = vec![Strategy::Override];
+            let plan = run(&f, &[adv("A-1", "p", "0", "1.0.1")], &policy());
+            assert_eq!(only(&plan).outcome.label(), expected, "chain of {len}");
+        }
+    }
+
+    #[test]
+    fn wide_corridors_below_max_depth_are_walked_once_per_depth() {
+        // root -> a -> 12 layers of 5 packages, each depending on every
+        // package of the next layer -> p, pinned by the last layer. A walk
+        // that never reused cut-off answers would visit 5^MAX_DEPTH paths.
+        let mut f = Fake::new();
+        let root = f.root("app", "0.1.0");
+        let layers: Vec<Vec<String>> = (0..12)
+            .map(|l| (0..5).map(|i| format!("l{l}x{i}")).collect())
+            .collect();
+        let reqs = |names: &[String]| -> Vec<(String, String)> {
+            names.iter().map(|n| (n.clone(), "^1".into())).collect()
+        };
+        let mut parents = vec![f.dep(root, "a", "1.0.0", "^1")];
+        let mut published = vec![("a".to_string(), reqs(&layers[0]))];
+        for (l, names) in layers.iter().enumerate() {
+            let ids: Vec<NodeId> = names
+                .iter()
+                .map(|n| f.graph.add_node(n, &v("1.0.0"), false, true))
+                .collect();
+            for &from in &parents {
+                for &to in &ids {
+                    f.graph.add_edge(from, to, VersionReq::new("^1"));
+                }
+            }
+            let deps = match layers.get(l + 1) {
+                Some(next) => reqs(next),
+                None => vec![("p".into(), "=1.0.0".into())],
+            };
+            published.extend(names.iter().map(|n| (n.clone(), deps.clone())));
+            parents = ids;
+        }
+        for &id in &parents {
+            f.dep(id, "p", "1.0.0", "=1.0.0");
+        }
+        for (name, deps) in &published {
+            let deps: Vec<(&str, &str)> =
+                deps.iter().map(|(n, r)| (n.as_str(), r.as_str())).collect();
+            f.publish(name, "1.0.0", &deps);
+        }
+        let a_deps: Vec<(&str, &str)> = layers[0].iter().map(|n| (n.as_str(), "^1")).collect();
+        f.publish("a", "1.1.0", &a_deps);
+        f.publish("p", "1.0.0", &[]).publish("p", "1.0.1", &[]);
+        f.unsupported = vec![Strategy::Override];
+        let plan = run(&f, &[adv("A-1", "p", "0", "1.0.1")], &policy());
+        // The pins are below MAX_DEPTH: assumed fine.
+        assert_eq!(only(&plan).change.as_ref().unwrap().to(), &v("1.1.0"));
+    }
+
+    #[test]
+    fn target_requirement_uses_the_version_a_fresh_resolution_picks() {
+        let mut f = transitive("=1.0.0");
+        f.publish("p", "1.0.2", &[]); // affected by B
+        f.publish_with("p", "1.0.3", &[], Some(old_date()), true); // yanked
+        f.publish("a", "1.1.0", &[("p", "^1.0.0")]); // resolves p@1.0.2
+        f.publish("a", "1.2.0", &[("p", ">=1.0.1, <1.0.2")]);
+        f.publish("a", "1.3.0", &[("p", "=1.0.4-rc.1")]);
+        f.publish("p", "1.0.4-rc.1", &[]);
+        let advisories = [
+            adv("A-1", "p", "0", "1.0.1"),
+            adv("B-1", "p", "1.0.2", "1.0.3"),
+        ];
+        let plan = run(&f, &advisories, &policy());
+        assert_eq!(
+            only(&plan).change.clone().unwrap(),
+            Change::DirectBump {
+                package: "a".into(),
+                from: v("1.0.0"),
+                to: v("1.2.0"),
+                bump: BumpKind::Minor,
+            }
+        );
+        // A prerelease pin resolves to that prerelease.
+        f.registry.get_mut("a").unwrap().retain(|r| {
+            let v = r.release.version.as_str();
+            v != "1.1.0" && v != "1.2.0"
+        });
+        let plan = run(&f, &advisories, &policy());
+        assert_eq!(only(&plan).change.as_ref().unwrap().to(), &v("1.3.0"));
+    }
+
+    #[test]
+    fn optional_dependencies_count_only_when_enabled() {
+        // root -> a -> b -> p; a@1.1.0 also has an optional pin on p.
+        let mut f = Fake::new();
+        let root = f.root("app", "0.1.0");
+        let a = f.dep(root, "a", "1.0.0", "^1");
+        let b = f.dep(a, "b", "1.0.0", "=1.0.0");
+        let p = f.dep(b, "p", "1.0.0", "=1.0.0");
+        f.publish("a", "1.0.0", &[("b", "=1.0.0")]);
+        f.publish("a", "1.1.0", &[("b", "^1.1.0"), ("p", "=1.0.0")]);
+        f.registry.get_mut("a").unwrap()[1].deps[1].optional = true;
+        f.publish("b", "1.0.0", &[("p", "=1.0.0")]);
+        f.publish("b", "1.1.0", &[("p", "^1.0.1")]);
+        f.publish("p", "1.0.0", &[]).publish("p", "1.0.1", &[]);
+        f.unsupported = vec![Strategy::Override];
+        let advisories = [adv("A-1", "p", "0", "1.0.1")];
+        let plan = run(&f, &advisories, &policy());
+        assert_eq!(only(&plan).change.as_ref().unwrap().to(), &v("1.1.0"));
+        // The feature is on today (a -> p in the graph): the pin counts.
+        f.graph.add_edge(a, p, VersionReq::new("=1.0.0"));
+        let plan = run(&f, &advisories, &policy());
+        assert_eq!(skip_reason(only(&plan)), &no_parent_fix("a", "p"));
+    }
+
+    #[test]
+    fn merged_change_must_fix_every_finding() {
+        // a@1.0.0 is vulnerable itself and pins p. A relock of a picks the
+        // latest 1.2.0, which pins p again; the bump of a for p picks 1.1.0.
+        let mut f = transitive("=1.0.0");
+        f.publish("a", "1.1.0", &[("p", "^1.0.1")]);
+        f.publish("a", "1.2.0", &[("p", "=1.0.0")]);
+        let mut pol = policy();
+        pol.target = TargetPolicy::LatestCompatible;
+        let advisories = [adv("A-1", "p", "0", "1.0.1"), adv("V-1", "a", "0", "1.0.1")];
+        let plan = run(&f, &advisories, &pol);
+        let merged = Change::DirectBump {
+            package: "a".into(),
+            from: v("1.0.0"),
+            to: v("1.1.0"),
+            bump: BumpKind::Minor,
+        };
+        assert_eq!(plan.changes, vec![merged.clone()]);
+        assert_eq!(plan.findings.len(), 2);
+        for finding in &plan.findings {
+            assert_eq!(finding.change, Some(merged.clone()), "{}", finding.package);
+        }
+    }
+
+    #[test]
+    fn merge_falls_back_to_the_lower_version_or_keeps_changes_apart() {
+        let relock = |to: &str| Change::Relock {
+            package: "p".into(),
+            from: v("1.0.0"),
+            to: v(to),
+        };
+        let finding = |via: &str, change: Change| Finding {
+            advisory: (&adv("A-1", "p", "0", "2.0.0")).into(),
+            package: "p".into(),
+            version: v("1.0.0"),
+            via: PackageRef {
+                name: via.into(),
+                version: v("1.0.0"),
+            },
+            paths: Vec::new(),
+            strategy: Some(change.strategy()),
+            outcome: Outcome::Planned {
+                strategy: change.strategy(),
+                change: change.clone(),
+            },
+            change: Some(change),
+        };
+        let findings = || vec![finding("a", relock("1.0.2")), finding("b", relock("1.0.1"))];
+        let f = Fake::new();
+        // b's parents do not allow 1.0.2: both move to 1.0.1.
+        let mut low = findings();
+        let changes = merge(&f, &policy(), &mut low, &mut |i, c| {
+            i == 0 || c.to() == &v("1.0.1")
+        });
+        assert_eq!(changes, vec![relock("1.0.1")]);
+        assert!(low.iter().all(|f| f.change == Some(relock("1.0.1"))));
+        // Neither version fixes both: each keeps its own change.
+        let mut apart = findings();
+        let changes = merge(&f, &policy(), &mut apart, &mut |i, c| {
+            c.to() == &v(["1.0.2", "1.0.1"][i])
+        });
+        assert_eq!(changes, vec![relock("1.0.2"), relock("1.0.1")]);
+        assert_eq!(apart[1].change, Some(relock("1.0.1")));
+    }
+
+    #[test]
+    fn two_vulnerable_versions_sort_in_version_order() {
+        // p@1.9.0 via a and p@1.10.0 via b; both pinned.
+        let mut f = Fake::new();
+        let root = f.root("app", "0.1.0");
+        let b = f.dep(root, "b", "1.0.0", "^1");
+        f.dep(b, "p", "1.10.0", "=1.10.0");
+        let a = f.dep(root, "a", "1.0.0", "^1");
+        f.dep(a, "p", "1.9.0", "=1.9.0");
+        for (name, pin) in [("a", "=1.9.0"), ("b", "=1.10.0")] {
+            f.publish(name, "1.0.0", &[("p", pin)]);
+            f.publish(name, "1.1.0", &[("p", "^1.11")]);
+        }
+        for version in ["1.9.0", "1.10.0", "1.11.0"] {
+            f.publish("p", version, &[]);
+        }
+        let plan = run(&f, &[adv("A-1", "p", "0", "1.11.0")], &policy());
+        let seen: Vec<(&str, &str)> = plan
+            .findings
+            .iter()
+            .map(|f| (f.version.as_str(), f.via.name.as_str()))
+            .collect();
+        assert_eq!(seen, vec![("1.9.0", "a"), ("1.10.0", "b")]);
+        let bumped: Vec<&str> = plan.changes.iter().map(Change::package).collect();
+        assert_eq!(bumped, vec!["a", "b"]);
+        assert!(plan.findings.iter().all(|f| f.outcome.label() == "planned"));
+    }
+
+    #[test]
+    fn prerelease_current_version_may_move_to_a_prerelease() {
+        let mut f = Fake::new();
+        let root = f.root("app", "0.1.0");
+        f.dep(root, "p", "1.0.0-rc.1", "=1.0.0-rc.1");
+        f.publish("p", "1.0.0-rc.1", &[])
+            .publish("p", "1.0.0-rc.2", &[]);
+        let plan = run(&f, &[adv("A-1", "p", "0", "1.0.0-rc.2")], &policy());
+        assert_eq!(
+            only(&plan).change,
+            Some(Change::DirectBump {
+                package: "p".into(),
+                from: v("1.0.0-rc.1"),
+                to: v("1.0.0-rc.2"),
+                bump: BumpKind::Patch,
+            })
+        );
+    }
+
+    #[test]
+    fn direct_bump_examines_at_most_max_candidates() {
+        for (pinned, expected) in [
+            (MAX_CANDIDATES - 1, "planned"),
+            (MAX_CANDIDATES, "skipped:no_parent_version_fixes"),
+        ] {
+            let mut f = transitive("=1.0.0");
+            for i in 1..=pinned {
+                f.publish("a", &format!("1.{i}.0"), &[("p", "=1.0.0")]);
+            }
+            f.publish("a", &format!("1.{}.0", pinned + 1), &[("p", "^1.0.1")]);
+            f.unsupported = vec![Strategy::Override];
+            let plan = run(&f, &[adv("A-1", "p", "0", "1.0.1")], &policy());
+            assert_eq!(only(&plan).outcome.label(), expected, "{pinned} pinned");
+        }
+    }
+
+    #[test]
+    fn direct_bump_latest_compatible_skips_too_recent_versions() {
+        let mut f = transitive("=1.0.0");
+        let recent = Some("2026-10-06T00:00:00Z".parse().unwrap());
+        f.publish("a", "1.1.0", &[("p", "^1.0.1")]);
+        f.publish_with("a", "1.2.0", &[("p", "^1.0.1")], recent, false);
+        f.publish("a", "1.3.0", &[("p", "^1.0.1")]);
+        f.publish_with("a", "1.4.0", &[("p", "^1.0.1")], recent, false);
+        let mut pol = policy();
+        pol.target = TargetPolicy::LatestCompatible;
+        let plan = run(&f, &[adv("A-1", "p", "0", "1.0.1")], &pol);
+        assert_eq!(only(&plan).change.as_ref().unwrap().to(), &v("1.3.0"));
+    }
+
+    #[test]
+    fn select_keeps_the_chosen_version_after_a_block() {
+        let f = Fake::new();
+        let mut pol = policy();
+        pol.target = TargetPolicy::LatestCompatible;
+        let input = PlanInput {
+            eco: &f,
+            graph: &f.graph,
+            advisories: &[],
+            policy: &pol,
+            ignores: &[],
+            now: now(),
+        };
+        let mut planner = Planner::new(&input);
+        let cands: Vec<Release> = ["1.0.1", "1.0.2", "1.0.3"]
+            .iter()
+            .map(|s| Release {
+                version: v(s),
+                published_at: Some(old_date()),
+                yanked: false,
+            })
+            .collect();
+        let reason = SkipReason::NoPatchedVersion {
+            package: "p".into(),
+        };
+        for (stop, expected) in [(false, "1.0.3"), (true, "1.0.1")] {
+            let chosen = planner
+                .select(&cands, |_, c| {
+                    Ok(match (c.version.as_str(), stop) {
+                        ("1.0.2", true) => Verdict::Stop(reason.clone()),
+                        ("1.0.2", false) => Verdict::Blocked(reason.clone()),
+                        _ => Verdict::Accept,
+                    })
+                })
+                .unwrap();
+            assert_eq!(chosen.ok().map(|r| r.version), Some(v(expected)));
+        }
     }
 }

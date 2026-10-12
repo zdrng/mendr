@@ -14,6 +14,7 @@ mod rules;
 mod safety;
 mod verify;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -86,17 +87,23 @@ enum Format {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(&cli) {
-        Ok(code) => ExitCode::from(code),
-        Err(e) => {
+    verify::install_signal_handlers();
+    match verify::catch_interrupt(|| run(&cli)) {
+        Ok(Ok(code)) => ExitCode::from(code),
+        Ok(Err(e)) => {
             progress::error(format!("{e:#}"));
             ExitCode::from(2)
+        }
+        Err(interrupted) => {
+            progress::error("interrupted");
+            ExitCode::from(interrupted.exit_code())
         }
     }
 }
 
 fn run(cli: &Cli) -> Result<u8> {
     progress::init(cli.quiet);
+    cache::prune();
     let started = Instant::now();
     let cwd = std::env::current_dir().context("reading current directory")?;
     let mut config = Config::load(cli.config.as_deref(), &cwd)?;
@@ -106,10 +113,6 @@ fn run(cli: &Cli) -> Result<u8> {
         min_release_age: cli.min_release_age.clone(),
     })?;
     config.validate(&ecosystem::names())?;
-
-    if !cli.plan_only {
-        safety::enforce(&config.safety)?;
-    }
 
     let mut osv = match &cli.osv_snapshot {
         Some(dir) => Osv::snapshot(&cwd.join(dir))?,
@@ -136,14 +139,19 @@ fn run(cli: &Cli) -> Result<u8> {
     };
 
     let mut projects = Vec::new();
+    let mut seen_ids = BTreeSet::new();
     for project in &config.projects {
         let mut pr = ProjectReport::new(&project.path, &config.base_dir);
-        if let Err(e) = run_project(cli, &config, project, &mut osv, now, &mut pr) {
+        let result = run_project(cli, &config, project, &mut osv, now, &mut seen_ids, &mut pr);
+        // A signal during write-back takes effect here.
+        verify::check_interrupted();
+        if let Err(e) = result {
             progress::error(format!("project {}: {e:#}", pr.path));
             pr.error = Some(format!("{e:#}"));
         }
         projects.push(pr);
     }
+    osv::warn_unmatched_ignores(&config.ignores, &seen_ids, today);
 
     let report = Report::new(mode, projects);
     let took = progress::elapsed(started);
@@ -182,6 +190,7 @@ fn run_project(
     project: &ProjectConfig,
     osv: &mut Osv,
     now: jiff::Timestamp,
+    seen_ids: &mut BTreeSet<String>,
     report: &mut ProjectReport,
 ) -> Result<()> {
     if !project.path.is_dir() {
@@ -218,6 +227,7 @@ fn run_project(
     let advisories = osv
         .advisories(eco.as_ref(), &packages)
         .context("looking up advisories")?;
+    osv::remember_ids(seen_ids, &advisories);
     step.done(
         "Checked",
         format!(
@@ -249,26 +259,45 @@ fn run_project(
         );
     }
 
-    if !cli.plan_only && !project_plan.changes.is_empty() {
-        let ctx = verify::VerifyContext {
-            eco: eco.as_ref(),
-            project,
-            commands: project.commands(eco.default_commands(&project.path)),
-            timeout: project.timeout,
-            policy: &config.policy,
-            ignores: &config.ignores,
-            now,
-        };
-        let verified = verify::verify(&ctx, osv, &mut project_plan)?;
-        if cli.write {
-            for file in verify::write_back(&ctx, &verified)? {
-                progress::line("Updated", display_path(&file));
-            }
-        }
-    }
-
+    let ctx = verify::VerifyContext {
+        eco: eco.as_ref(),
+        project,
+        commands: project.commands(eco.default_commands(&project.path)),
+        timeout: project.timeout,
+        policy: &config.policy,
+        ignores: &config.ignores,
+        now,
+    };
+    let result = verify_plan(cli, &ctx, osv, &mut project_plan, &mut |dir| {
+        safety::enforce(&config.safety, dir)
+    });
+    // Also on errors (e.g. a safety refusal): the plan is still worth reporting.
     report.findings = project_plan.findings;
     report.changes = project_plan.changes;
+    result
+}
+
+/// Unless `--plan-only` or there is nothing to change: run the safety
+/// checks (`safety` with the project dir; only now, so projects without
+/// fixes never need a sandbox), verify the changes and, with `--write`,
+/// write them back.
+fn verify_plan(
+    cli: &Cli,
+    ctx: &verify::VerifyContext,
+    osv: &mut Osv,
+    plan: &mut plan::ProjectPlan,
+    safety: &mut dyn FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    if cli.plan_only || plan.changes.is_empty() {
+        return Ok(());
+    }
+    safety(&ctx.project.path)?;
+    let verified = verify::verify(ctx, osv, plan)?;
+    if cli.write {
+        for file in verify::write_back(ctx, &verified)? {
+            progress::line("Updated", display_path(&file));
+        }
+    }
     Ok(())
 }
 
@@ -307,5 +336,52 @@ fn summarize(report: &Report) -> Option<String> {
             progress::count(n, "finding", "findings"),
             parts.join(", ")
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Policy;
+    use crate::ecosystem::fake::Fake;
+    use crate::model::{Change, Version};
+
+    #[test]
+    fn safety_runs_only_right_before_verifying() {
+        let fake = Fake::new();
+        let project = ProjectConfig::at(PathBuf::from("/nonexistent/project"));
+        let policy = Policy::default();
+        let ctx = verify::VerifyContext {
+            eco: &fake,
+            project: &project,
+            commands: Default::default(),
+            timeout: None,
+            policy: &policy,
+            ignores: &[],
+            now: jiff::Timestamp::now(),
+        };
+        let mut osv = Osv::Snapshot(Vec::new());
+        let mut calls = Vec::new();
+        let mut refuse = |dir: &Path| {
+            calls.push(dir.to_path_buf());
+            Err(anyhow!("refused"))
+        };
+        let full = Cli::parse_from(["mendr"]);
+        let plan_only = Cli::parse_from(["mendr", "--plan-only"]);
+        let mut nothing = plan::ProjectPlan::default();
+        let mut something = plan::ProjectPlan {
+            findings: Vec::new(),
+            changes: vec![Change::Relock {
+                package: "p".into(),
+                from: Version::new("1.0.0"),
+                to: Version::new("1.0.1"),
+            }],
+        };
+
+        verify_plan(&full, &ctx, &mut osv, &mut nothing, &mut refuse).unwrap();
+        verify_plan(&plan_only, &ctx, &mut osv, &mut something, &mut refuse).unwrap();
+        let err = verify_plan(&full, &ctx, &mut osv, &mut something, &mut refuse).unwrap_err();
+        assert_eq!(err.to_string(), "refused");
+        assert_eq!(calls, vec![project.path.clone()]);
     }
 }
