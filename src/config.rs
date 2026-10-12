@@ -9,7 +9,7 @@
 //! target = "minimal"            # or "latest-compatible"
 //!
 //! [safety]
-//! allow-unsandboxed = false
+//! allow-secrets = false
 //! deny-paths = ["~/.aws"]       # extra paths that must not be readable
 //!                               # (`~/` = HOME, relative = config file dir)
 //!
@@ -129,8 +129,8 @@ pub struct IgnoreRule {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SafetyConfig {
-    /// Run builds even if safety checks fail (`--allow-unsandboxed`).
-    pub allow_unsandboxed: bool,
+    /// Run builds even if safety checks fail (`--allow-secrets`).
+    pub allow_secrets: bool,
     /// Extra paths that must not be readable. `~` / `~/...` are expanded by
     /// the safety check; other relative paths are joined onto the config
     /// file's directory when the config is parsed.
@@ -183,7 +183,7 @@ pub struct Config {
 #[derive(Clone, Debug, Default)]
 pub struct Overrides {
     pub allow_major: bool,
-    pub allow_unsandboxed: bool,
+    pub allow_secrets: bool,
     pub min_release_age: Option<String>,
     pub sandbox: bool,
 }
@@ -216,7 +216,7 @@ struct RawPolicy {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct RawSafety {
     #[serde(default)]
-    allow_unsandboxed: bool,
+    allow_secrets: bool,
     #[serde(default)]
     deny_paths: Vec<String>,
 }
@@ -375,7 +375,7 @@ impl Config {
             file: None,
             policy,
             safety: SafetyConfig {
-                allow_unsandboxed: raw.safety.allow_unsandboxed,
+                allow_secrets: raw.safety.allow_secrets,
                 deny_paths: raw
                     .safety
                     .deny_paths
@@ -429,8 +429,8 @@ impl Config {
         if o.allow_major {
             self.policy.allow_major = true;
         }
-        if o.allow_unsandboxed {
-            self.safety.allow_unsandboxed = true;
+        if o.allow_secrets {
+            self.safety.allow_secrets = true;
         }
         if let Some(age) = &o.min_release_age {
             self.policy.min_release_age = parse_duration(age).context("--min-release-age")?;
@@ -580,13 +580,13 @@ expires = "2027-01-02"
         let mut c = Config::parse("[policy]\nmin-release-age = \"7d\"\n", Path::new("/r")).unwrap();
         c.apply_overrides(&Overrides {
             allow_major: true,
-            allow_unsandboxed: true,
+            allow_secrets: true,
             min_release_age: Some("0".into()),
             sandbox: false,
         })
         .unwrap();
         assert!(c.policy.allow_major);
-        assert!(c.safety.allow_unsandboxed);
+        assert!(c.safety.allow_secrets);
         assert_eq!(c.policy.min_release_age, Duration::ZERO);
         assert!(
             c.apply_overrides(&Overrides {

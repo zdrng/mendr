@@ -83,7 +83,7 @@ the elapsed time and the current request or command:
 | `--output <FILE>` | write the report to a file instead of stdout |
 | `--osv-snapshot <DIR>` | read OSV records from `DIR/*.json` (one record per file, osv.dev schema) instead of the live API |
 | `--allow-major` | allow major version bumps (`[policy] allow-major`) |
-| `--allow-unsandboxed` | run builds even when the safety checks fail (`[safety] allow-unsandboxed`) |
+| `--allow-secrets` | run builds even when the safety checks find secrets the build could read, also with `--sandbox` (`[safety] allow-secrets`) |
 | `--sandbox` | run install/build/test in throwaway Docker/Podman containers (needs `[sandbox]`, see [Sandbox](#sandbox)) |
 | `--min-release-age <DUR>` | minimum age of any version mendr picks: `"7d"`, `"12h"`, `"20m"`, `"30s"`, `"0"` = off (`[policy] min-release-age`, default `7d`) |
 | `-q`, `--quiet` | print only warnings and errors on stderr |
@@ -103,7 +103,7 @@ min-severity = "low"         # low | medium | high | critical; unknown severity 
 target = "minimal"           # or "latest-compatible": highest fixed version without another major bump
 
 [safety]
-allow-unsandboxed = false
+allow-secrets = false
 deny-paths = ["~/.aws", "/etc/secrets"]   # extra paths that must not be readable (`~/` = HOME)
 
 [sandbox]                    # only used with --sandbox; no defaults, both keys required
@@ -167,7 +167,7 @@ build that project (it reports a project error, exit 2) if it finds any:
   `.template`).
 
 Run mendr with `--sandbox` (below), run it where none of this is reachable (a container or CI job
-without secrets), use `--plan-only`, or accept the risk with `--allow-unsandboxed` (mendr then
+without secrets), use `--plan-only`, or accept the risk with `--allow-secrets` (mendr then
 prints the list as a warning). The checks look for danger; they cannot prove isolation.
 
 The temp copy leaves out `.git` and every `node_modules`. Commands run in their own process
@@ -199,7 +199,7 @@ image = "docker.io/library/rust:1-slim"    # e.g. docker.io/library/node:22-slim
   toolchain should be at least as new as the host's (e.g. a newer host Cargo may write a
   lockfile version an old image cannot read; the baseline then fails with the log).
 - The host checks above are skipped; the project checks (`.npmrc` tokens, `.env` files) still
-  run, because those files are copied into the container.
+  run, because those files are copied into the container (`--allow-secrets` accepts them).
 - The temp dir must be visible inside the container. On macOS the engine runs in a VM that
   shares only some host directories: the default `TMPDIR` (`/var/folders/...`) works with Docker
   Desktop and Podman machines; with Colima, or inside `nix develop` (which sets `TMPDIR` to
@@ -276,8 +276,8 @@ vulnerable dependencies, one directory per scenario (relock, direct bump, overri
 that breaks the build or the tests, a broken baseline, a two-project `mendr.toml`), each with its
 lockfile, a frozen OSV snapshot and an `expected.json`. The harness runs the `mendr` binary in an
 isolated environment (empty `HOME`, cleared env), so the safety checks pass without
-`--allow-unsandboxed`. If a container daemon socket is reachable on your machine, stop it or set
-`MENDR_FIXTURE_ALLOW_UNSANDBOXED=1`.
+`--allow-secrets`. If a container daemon socket is reachable on your machine, stop it or set
+`MENDR_FIXTURE_ALLOW_SECRETS=1`.
 
 ### Adding an ecosystem
 

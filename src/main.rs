@@ -61,10 +61,10 @@ struct Cli {
     #[arg(long)]
     allow_major: bool,
 
-    /// Run builds even when the safety checks find secrets reachable from
-    /// this environment (overrides [safety] allow-unsandboxed).
+    /// Run builds even when the safety checks find secrets the build could
+    /// read (overrides [safety] allow-secrets).
     #[arg(long)]
-    allow_unsandboxed: bool,
+    allow_secrets: bool,
 
     /// Run install/build/test in throwaway containers that see only the
     /// project copy (needs a [sandbox] section in mendr.toml).
@@ -115,7 +115,7 @@ fn run(cli: &Cli) -> Result<u8> {
     let mut config = Config::load(cli.config.as_deref(), &cwd)?;
     config.apply_overrides(&Overrides {
         allow_major: cli.allow_major,
-        allow_unsandboxed: cli.allow_unsandboxed,
+        allow_secrets: cli.allow_secrets,
         min_release_age: cli.min_release_age.clone(),
         sandbox: cli.sandbox,
     })?;

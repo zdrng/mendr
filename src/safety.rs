@@ -2,8 +2,8 @@
 //!
 //! Builds and tests execute untrusted code (build scripts, test suites,
 //! install hooks of new dependency versions). mendr refuses to run them when
-//! secrets are reachable, unless `--allow-unsandboxed` /
-//! `[safety] allow-unsandboxed = true`.
+//! secrets are reachable, unless `--allow-secrets` /
+//! `[safety] allow-secrets = true`.
 //!
 //! Isolation cannot be proven from inside, so the checks look for *danger*:
 //! - credential files readable under `HOME` (SSH private keys, also in
@@ -252,7 +252,7 @@ fn is_env_file(name: &str) -> bool {
 }
 
 /// Fail unless the environment checks and the checks on `project` are
-/// clean or unsandboxed runs are allowed. Prints a warning listing
+/// clean or reachable secrets are allowed (`allow-secrets`). Prints a warning listing
 /// violations when they are allowed.
 pub fn enforce(config: &SafetyConfig, project: &Path) -> Result<()> {
     let env = Environment::current();
@@ -261,8 +261,8 @@ pub fn enforce(config: &SafetyConfig, project: &Path) -> Result<()> {
     decide(
         config,
         &violations,
-        "Run mendr with --sandbox (see [sandbox] in mendr.toml) or in a sandbox/container \
-         without them, use --plan-only, or pass --allow-unsandboxed to run anyway.",
+        "Run mendr with --sandbox (see [sandbox] in mendr.toml) or somewhere without them, \
+         use --plan-only, or pass --allow-secrets to run anyway.",
     )
 }
 
@@ -273,7 +273,7 @@ pub fn enforce_project(config: &SafetyConfig, project: &Path) -> Result<()> {
         config,
         &check_project(project, &Environment::current()),
         "They are copied into the sandbox: remove them from the project, use --plan-only, \
-         or pass --allow-unsandboxed to run anyway.",
+         or pass --allow-secrets to run anyway.",
     )
 }
 
@@ -285,9 +285,9 @@ fn decide(config: &SafetyConfig, violations: &[Violation], hint: &str) -> Result
         .iter()
         .map(|v| format!("  - [{}] {}", v.check, v.detail))
         .collect();
-    if config.allow_unsandboxed {
+    if config.allow_secrets {
         crate::progress::warn(format!(
-            "running builds with secrets reachable (--allow-unsandboxed):\n{}",
+            "running builds with secrets reachable (--allow-secrets):\n{}",
             list.join("\n")
         ));
         return Ok(());
@@ -1169,7 +1169,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         write(&home.path().join("secrets/key"), "x");
         let config = SafetyConfig {
-            allow_unsandboxed: false,
+            allow_secrets: false,
             deny_paths: vec![
                 "~/secrets".into(),
                 "~/missing".into(),
@@ -1192,15 +1192,15 @@ mod tests {
         )];
         let mut config = SafetyConfig::default();
         assert!(decide(&config, &[], "hint").is_ok());
-        let err = decide(&config, &v, "Pass --allow-unsandboxed.")
+        let err = decide(&config, &v, "Pass --allow-secrets.")
             .unwrap_err()
             .to_string();
         assert!(
             err.contains("[secret-env] environment variable X_TOKEN"),
             "{err}"
         );
-        assert!(err.contains("--allow-unsandboxed"), "{err}");
-        config.allow_unsandboxed = true;
+        assert!(err.contains("--allow-secrets"), "{err}");
+        config.allow_secrets = true;
         assert!(decide(&config, &v, "hint").is_ok());
     }
 }

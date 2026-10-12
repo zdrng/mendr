@@ -65,7 +65,7 @@ min-severity = "medium"      # default "low" (everything)
 target = "minimal"           # or "latest-compatible"
 
 [safety]
-allow-unsandboxed = false
+allow-secrets = false
 deny-paths = ["~/.aws"]
 
 [sandbox]                    # only with --sandbox; both keys required, no defaults
@@ -89,7 +89,7 @@ reason = "not reachable"
 expires = 2026-12-31
 ```
 
-CLI overrides: `--allow-major`, `--allow-unsandboxed`, `--sandbox`, `--min-release-age <dur>`,
+CLI overrides: `--allow-major`, `--allow-secrets`, `--sandbox`, `--min-release-age <dur>`,
 `--plan-only`, `--format json|markdown`, `--osv-snapshot <dir>`, `--output <file>`, `--write`, `--config <path>`.
 Without a config file mendr uses the defaults and one auto-detected project in the current
 directory. Full reference: the doc comment at the top of `src/config.rs`.
@@ -263,10 +263,10 @@ Constraints to keep in mind:
   Exclude `test-projects/` from Dependabot and dismiss alerts for it.
 - **Fixtures run untrusted build scripts.** Fixable scenarios run in full mode (build + test). CI
   runs them on a runner VM with no secrets and Docker stopped, so mendr's own safety checks pass
-  without `--allow-unsandboxed`; this doubles as a test of the safety checks. The harness passes
+  without `--allow-secrets`; this doubles as a test of the safety checks. The harness passes
   only `PATH`, an empty `HOME`, cache dirs and the dev shell's toolchain variables (`NIX_*` except
   `NIX_CONFIG`, `SDKROOT`, `CC`, ...; needed to link on macOS). Locally,
-  `MENDR_FIXTURE_ALLOW_UNSANDBOXED=1` adds `--allow-unsandboxed` for machines with a reachable
+  `MENDR_FIXTURE_ALLOW_SECRETS=1` adds `--allow-secrets` for machines with a reachable
   container socket. `expected.json` can check file contents after `--write` (`files`).
 - **Pick vulnerable packages carefully.** Old, well-known advisories with stable fixes, no install
   scripts, exact versions pinned in the lockfile. Verify each scenario actually reproduces.
@@ -307,7 +307,7 @@ Constraints to keep in mind:
 
 ### M3 — Verification and safety
 - [x] `safety.rs`: credential files, secret env vars, Docker socket, configurable deny paths
-- [x] Refuse to run unless checks pass or `--allow-unsandboxed`
+- [x] Refuse to run unless checks pass or `--allow-secrets`
 - [x] `verify.rs`: temp copy, baseline build/test, apply, build, test, keep or revert
 - [x] Command timeouts
 - [x] Rescan after each change → `NewVulnerabilityIntroduced`

@@ -74,7 +74,7 @@ Isolation rules:
    `MACOSX_DEPLOYMENT_TARGET`, `CC`, `CXX`, `AR`, `AS`, `LD`, `NM`, `RANLIB`,
    `STRIP` (needed to link on macOS). The empty `HOME` and cleared
    environment are why mendr's safety checks pass without
-   `--allow-unsandboxed`.
+   `--allow-secrets`.
 3. The exit code and the findings in the JSON report are compared with
    `expected.json`, then the `files` expectations are checked in the copy.
 
@@ -85,11 +85,11 @@ machine: mendr then refuses (exit 2). Stop the daemon, or opt in explicitly
 for local runs:
 
 ```sh
-MENDR_FIXTURE_ALLOW_UNSANDBOXED=1 nix develop -c cargo test --test fixtures -- --ignored
+MENDR_FIXTURE_ALLOW_SECRETS=1 nix develop -c cargo test --test fixtures -- --ignored
 ```
 
-With `MENDR_FIXTURE_ALLOW_UNSANDBOXED=1` the harness passes
-`--allow-unsandboxed` to full-mode runs. CI never sets it.
+With `MENDR_FIXTURE_ALLOW_SECRETS=1` the harness passes
+`--allow-secrets` to full-mode runs. CI never sets it.
 
 ## `expected.json`
 

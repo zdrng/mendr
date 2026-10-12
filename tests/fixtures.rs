@@ -9,7 +9,7 @@
 //! MENDR_FIXTURE=cargo/relock nix develop -c cargo test --test fixtures -- --ignored  # one scenario
 //! ```
 //!
-//! `MENDR_FIXTURE_ALLOW_UNSANDBOXED=1` passes `--allow-unsandboxed` to
+//! `MENDR_FIXTURE_ALLOW_SECRETS=1` passes `--allow-secrets` to
 //! full-mode runs (for machines with a reachable container daemon socket).
 
 use std::collections::BTreeMap;
@@ -245,10 +245,8 @@ fn run_scenario(dir: &Path) -> Result<(), String> {
         }
         // Escape hatch for machines where mendr's safety checks fail even in
         // the isolated environment (e.g. a reachable /var/run/docker.sock).
-        Mode::Full
-            if std::env::var_os("MENDR_FIXTURE_ALLOW_UNSANDBOXED").is_some_and(|v| v == "1") =>
-        {
-            cmd.arg("--allow-unsandboxed");
+        Mode::Full if std::env::var_os("MENDR_FIXTURE_ALLOW_SECRETS").is_some_and(|v| v == "1") => {
+            cmd.arg("--allow-secrets");
         }
         Mode::Full => {}
     }
