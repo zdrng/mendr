@@ -46,7 +46,7 @@ jobs:
         run: |
           sudo systemctl stop docker.socket docker.service containerd.service || true
           sudo rm -f /var/run/docker.sock /run/docker.sock
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: target
           key: fixtures-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'test-projects/**/Cargo.lock', 'test-projects/**/package-lock.json', 'test-projects/**/pnpm-lock.yaml', 'test-projects/**/gradle.lockfile') }}
