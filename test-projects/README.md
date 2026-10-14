@@ -28,6 +28,9 @@ Adding a scenario needs no harness change: any directory below
 | `pnpm/direct-bump` | full | jsprim bumped to 1.4.2, `--write` -> `fixed`, files checked |
 | `pnpm/override` | full | path-to-regexp overridden to 0.1.13 for router 1.3.8 in `pnpm-workspace.yaml`, `--write` -> `fixed`, files checked |
 | `pnpm/build-break` | full | only fix is nth-check 2.0.1 (`--allow-major`), which breaks `pnpm test` -> `failed:test_failed` |
+| `gradle/direct-bump` | full | commons-text bumped to 1.10.0 in `gradle/libs.versions.toml`, `--write` -> `fixed`, files checked |
+| `gradle/override` | full | jackson-databind (managed by `jackson-bom`) constrained to 2.13.4 in `build.gradle`, `--write` -> `fixed`, files checked |
+| `gradle/build-break` | full | only fix is guava 24.1.1-android (`--allow-major`), which removed `Objects.toStringHelper` -> `failed:build_failed` |
 | `mixed/monorepo` | full | `mendr.toml` with a Cargo and an npm project, `[[ignore]]` with and without expiry, `--write` -> `fixed` / `skipped:ignored`, files checked |
 
 ## Layout
@@ -35,7 +38,7 @@ Adding a scenario needs no harness change: any directory below
 ```
 test-projects/<ecosystem>/<scenario>/
   Cargo.toml / package.json ...  the real project
-  Cargo.lock / package-lock.json / pnpm-lock.yaml
+  Cargo.lock / package-lock.json / pnpm-lock.yaml / gradle.lockfile
                                  committed lockfile pinning the vulnerable version
   mendr.toml                     optional config
   osv/                           OSV records this scenario needs (one record per *.json file,
@@ -55,22 +58,27 @@ Isolation rules:
   them as part of mendr's workspace.
 - npm fixtures must not sit under a `package.json` with workspaces, pnpm fixtures not under a
   `pnpm-workspace.yaml`.
+- Gradle fixtures have their own `settings.gradle(.kts)`, enable
+  `dependencyLocking { lockAllConfigurations() }` and ship no wrapper (the dev shell's
+  `gradle` runs them). Regenerate a lockfile with
+  `nix develop -c gradle dependencies --write-locks` in the scenario directory.
 - Pick old, well-known advisories with stable fixes; no install scripts; exact
   versions pinned in the lockfile.
 
 ## How a scenario runs
 
 1. The scenario directory is copied to a temp dir (without `target/`,
-   `node_modules/`).
+   `node_modules/`, `build/`, `.gradle/`).
 2. `mendr --format json --osv-snapshot <copy>/osv [--plan-only] <args...>` runs
    with the copy as working directory and an isolated environment:
    `env_clear()`, then only `PATH`, `HOME=<fresh empty dir>`,
    `CARGO_HOME=target/fixture-cache/cargo`,
    `npm_config_cache=target/fixture-cache/npm`,
    `pnpm_config_store_dir=target/fixture-cache/pnpm-store`,
+   `GRADLE_USER_HOME=target/fixture-cache/gradle`,
    `MENDR_CACHE_DIR=target/fixture-cache/mendr`, plus the dev shell's
    toolchain variables when set: `NIX_*` (except `NIX_CONFIG`, which can hold
-   tokens), `SSL_CERT_FILE`, `SDKROOT`, `DEVELOPER_DIR`,
+   tokens), `SSL_CERT_FILE`, `JAVA_HOME`, `SDKROOT`, `DEVELOPER_DIR`,
    `MACOSX_DEPLOYMENT_TARGET`, `CC`, `CXX`, `AR`, `AS`, `LD`, `NM`, `RANLIB`,
    `STRIP` (needed to link on macOS). The empty `HOME` and cleared
    environment are why mendr's safety checks pass without

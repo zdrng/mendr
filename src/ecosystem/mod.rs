@@ -27,6 +27,7 @@ use crate::model::{BumpKind, Change, DepGraph, FailReason, Strategy, Version, Ve
 pub mod cargo;
 #[cfg(test)]
 pub mod fake;
+pub mod gradle;
 pub mod npm;
 pub mod pnpm;
 // -----------------------------------------------------------------------------
@@ -37,6 +38,7 @@ pub fn ecosystems(npm: &NpmConfig) -> Vec<Box<dyn Ecosystem>> {
         Box::new(cargo::Cargo::new()),
         Box::new(npm::Npm::new(npm.clone())),
         Box::new(pnpm::Pnpm::new()),
+        Box::new(gradle::Gradle::new()),
     ]
 }
 
@@ -149,12 +151,25 @@ impl From<crate::http::HttpError> for AdapterError {
     }
 }
 
+/// Runs a shell command line in a project copy the way verification runs
+/// install/build/test: own process group, the project's timeout, inside the
+/// container with `--sandbox`. For adapters whose lockfile update runs
+/// project code (Gradle's build scripts).
+pub trait Shell {
+    /// `sh -c command` in `dir`; a non-zero exit or a timeout is an
+    /// [`AdapterError::Command`] with the output's tail.
+    fn run(&self, dir: &Path, command: &str) -> Result<(), AdapterError>;
+}
+
 /// Options for [`Ecosystem::apply`].
-#[derive(Debug, Clone, Default)]
-pub struct ApplyOptions {
+#[derive(Clone, Copy, Default)]
+pub struct ApplyOptions<'a> {
     /// Newest publish time a resolver may pick (`now - min-release-age`).
     /// `None` when the release-age policy is disabled.
     pub release_cutoff: Option<jiff::Timestamp>,
+    /// Where to run commands that execute project code. Verification
+    /// always sets it (after the safety checks passed); `None` in unit tests.
+    pub shell: Option<&'a dyn Shell>,
 }
 
 /// One package ecosystem. Implementations are stateless or hold only caches
@@ -209,25 +224,28 @@ pub trait Ecosystem {
 
     /// Apply one change inside `workdir` (always a temporary copy, never the
     /// user's checkout): edit manifests and update the lockfile. Must not run
-    /// install scripts. Adapters whose resolver can honour
-    /// `opts.release_cutoff` (e.g. `npm --before`) should pass it on.
+    /// install scripts; a lockfile update that cannot avoid running project
+    /// code (Gradle) goes through `opts.shell`. Adapters whose resolver can
+    /// honour `opts.release_cutoff` (e.g. `npm --before`) should pass it on.
     fn apply(
         &self,
         workdir: &Path,
         change: &Change,
-        opts: &ApplyOptions,
+        opts: &ApplyOptions<'_>,
     ) -> Result<(), AdapterError>;
 
     /// Default install/build/test commands for this project. Overridden per
     /// field by `[[project]]` config.
     fn default_commands(&self, project_dir: &Path) -> Commands;
 
-    /// Top-level directory names to skip when copying the project to a
-    /// temporary directory (`["target"]`, `["node_modules"]`).
+    /// Directories to skip when copying the project to a temporary
+    /// directory, as paths relative to the project root (`["target"]`,
+    /// `["node_modules"]`, `["buildSrc/build"]`).
     fn copy_excludes(&self) -> &'static [&'static str];
 
     /// File names (matched at any depth, e.g. every workspace member's
-    /// manifest) that `apply` may create, change or delete. Verification
+    /// manifest; `*suffix` matches names ending in `suffix`) that `apply`
+    /// may create, change or delete. Verification
     /// snapshots, compares and restores only these around each change, and
     /// `--write` copies back only these. Empty (the default) = any file,
     /// which is correct but slow on big trees.

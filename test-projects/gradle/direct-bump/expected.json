@@ -1,0 +1,20 @@
+{
+  "mode": "full",
+  "args": ["--write"],
+  "exit_code": 0,
+  "findings": [
+    {
+      "advisory": "GHSA-599f-7c49-w659",
+      "package": "org.apache.commons:commons-text",
+      "version": "1.9",
+      "via": "org.apache.commons:commons-text",
+      "strategy": "direct_bump",
+      "target": { "package": "org.apache.commons:commons-text", "to": "1.10.0" },
+      "outcome": "fixed"
+    }
+  ],
+  "files": {
+    "gradle/libs.versions.toml": ["commons-text = \"1.10.0\""],
+    "gradle.lockfile": ["org.apache.commons:commons-text:1.10.0="]
+  }
+}

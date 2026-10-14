@@ -1,0 +1,20 @@
+{
+  "mode": "full",
+  "args": ["--write"],
+  "exit_code": 0,
+  "findings": [
+    {
+      "advisory": "GHSA-rgv9-q543-rqg4",
+      "package": "com.fasterxml.jackson.core:jackson-databind",
+      "version": "2.13.0",
+      "via": "com.fasterxml.jackson.core:jackson-databind",
+      "strategy": "override",
+      "target": { "package": "com.fasterxml.jackson.core:jackson-databind", "to": "2.13.4" },
+      "outcome": "fixed"
+    }
+  ],
+  "files": {
+    "build.gradle": ["implementation('com.fasterxml.jackson.core:jackson-databind:2.13.4')"],
+    "gradle.lockfile": ["com.fasterxml.jackson.core:jackson-databind:2.13.4="]
+  }
+}

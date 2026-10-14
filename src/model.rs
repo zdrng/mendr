@@ -101,7 +101,10 @@ pub struct Edge {
 ///   root package) and have `registry == false`;
 /// - every registry node is reachable from some root;
 /// - dev-dependencies of the project's own packages are included (they are
-///   built and tested), dev-dependencies of registry packages are not.
+///   built and tested), dev-dependencies of registry packages are not;
+/// - an edge from a root has an empty `req` only if the root's manifests
+///   give the dependency no version mendr can rewrite (Gradle: managed by a
+///   platform/BOM or plugin). The planner never direct-bumps through it.
 ///
 /// Add nodes and edges only through the methods below: they keep the lookup
 /// index in sync. Changing `direct` or `version` of an existing node in place

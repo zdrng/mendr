@@ -1,0 +1,5 @@
+[versions]
+commons-text = "1.9"
+
+[libraries]
+commons-text = { module = "org.apache.commons:commons-text", version.ref = "commons-text" }

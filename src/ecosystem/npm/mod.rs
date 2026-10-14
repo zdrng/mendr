@@ -571,6 +571,7 @@ mod tests {
         let cutoff = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(7 * 24);
         let opts = ApplyOptions {
             release_cutoff: Some(cutoff),
+            ..ApplyOptions::default()
         };
         let cases = [
             (

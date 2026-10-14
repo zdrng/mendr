@@ -26,11 +26,11 @@ jobs:
         run: nix develop -c cargo test
 
   # Runs mendr against test-projects/ (real builds and tests of intentionally
-  # vulnerable projects, so untrusted build scripts). Rust, Node and pnpm come
-  # from the flake's dev shell. The harness already clears the environment and
-  # uses an empty HOME; this job additionally keeps secrets off the machine so
-  # mendr's safety checks pass without --allow-secrets (never set
-  # MENDR_FIXTURE_ALLOW_SECRETS here).
+  # vulnerable projects, so untrusted build scripts). Rust, Node, pnpm, Gradle
+  # and the JDK come from the flake's dev shell. The harness already clears the
+  # environment and uses an empty HOME; this job additionally keeps secrets off
+  # the machine so mendr's safety checks pass without --allow-secrets (never
+  # set MENDR_FIXTURE_ALLOW_SECRETS here).
   fixtures:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -49,7 +49,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target
-          key: fixtures-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'test-projects/**/Cargo.lock', 'test-projects/**/package-lock.json', 'test-projects/**/pnpm-lock.yaml') }}
+          key: fixtures-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'test-projects/**/Cargo.lock', 'test-projects/**/package-lock.json', 'test-projects/**/pnpm-lock.yaml', 'test-projects/**/gradle.lockfile') }}
           restore-keys: fixtures-${{ runner.os }}-
       - name: Warm up dev shell
         run: nix develop -c true

@@ -25,6 +25,8 @@
             pkgs.rust-analyzer
             pkgs.nodejs_22
             pkgs.pnpm
+            pkgs.gradle
+            pkgs.jdk21
             pkgs.git
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];

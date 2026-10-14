@@ -47,7 +47,8 @@ src/
     mod.rs           Ecosystem trait + detection
     cargo.rs
     npm/             lockfile, manifest, registry, semver
-    gradle.rs        (M5)
+    pnpm/            lockfile, manifest, overrides, registry, semver
+    gradle/          lockfile, graph, declare, constraints, registry (deps.dev), version
     fake.rs          in-memory ecosystem for unit tests
 tests/
   fixtures.rs        runs the binary against every test project
@@ -175,6 +176,23 @@ tags: `{"kind": "skipped", "reason": {"kind": "no_parent_version_fixes", ...}}`.
     releases are deprecated). Bundled dependencies are not part of the graph.
   - serde_json's `preserve_order` feature is enabled crate-wide so manifest rewrites keep key order.
 
+- Gradle (`src/ecosystem/gradle/`), builds with dependency locking only:
+  - the graph is rebuilt without running Gradle: one root per project lockfile, every locked
+    module the build declares hangs off it (requirement = the declared version, empty when it
+    has none: platform/BOM/plugin-managed, so never direct-bumped), module edges come from
+    each locked version's POM via deps.dev (only to versions locked in the same project with a
+    configuration in common), and anything still unreachable hangs off its root with an empty
+    requirement. Declarations are matched build-wide, not per project.
+  - `satisfies` treats a plain version as exact (what a fresh resolution picks for a POM pin),
+    so relocks never apply; `shared_copies` is true (one version per configuration).
+  - apply edits the build files, then runs `gradle dependencies --write-locks` through
+    `ApplyOptions::shell` (the build scripts run, so only during verification, after the
+    safety checks, sandboxed with `--sandbox`). "Cannot find a version of" / "Could not find"
+    -> `ResolutionConflict`.
+  - Gradle resolves conflicts to the highest version, so a bump through one direct dependency
+    often fixes the findings of another via too; verification keeps such later changes
+    without applying them.
+
 ### Verification and safety (M3)
 
 - Changes are applied **cumulatively** in one temp copy, in `plan.changes` order: each change is
@@ -182,13 +200,14 @@ tags: `{"kind": "skipped", "reason": {"kind": "no_parent_version_fixes", ...}}`.
   kept change therefore already ran build + test with all kept changes; the combined
   install/build/test re-run happens only when a later attempt was reverted (it may have left
   state in excluded dirs). If that re-run fails, every kept change fails with its reason.
-- A change whose `package@from` is no longer locked (an earlier kept change already moved it) is
-  not applied; it is kept if the rescan shows its findings fixed, else `still_vulnerable`.
-- The copy skips top-level `copy_excludes()` and drops symlinks that do not resolve inside the
-  project. Snapshots/restores also skip `copy_excludes()` and leave them as they are, so the
-  install command must reconcile them (e.g. `npm ci`). Consequence: dependencies outside the
-  project dir (Cargo `path = "../x"`) are missing in the copy -> `baseline_failed`; point
-  `[[project]] path` at the workspace root instead.
+- A change whose findings an earlier kept change already fixed is not applied and kept. One
+  whose `package@from` is no longer locked (an earlier kept change already moved it) is not
+  applied either; it is kept if the rescan shows its findings fixed, else `still_vulnerable`.
+- The copy skips `copy_excludes()` (paths relative to the project) and drops symlinks that
+  do not resolve inside the project. Snapshots/restores also skip `copy_excludes()` and leave
+  them as they are, so the install command must reconcile them (e.g. `npm ci`). Consequence:
+  dependencies outside the project dir (Cargo `path = "../x"`) are missing in the copy ->
+  `baseline_failed`; point `[[project]] path` at the workspace root instead.
 - **Adapters:** `apply` must change only manifests/lockfiles inside `workdir` (no temp files
   left behind): `--write` copies back exactly the non-excluded files `apply` changed, with
   their content captured right after `apply` (build/test output never reaches the project).
@@ -238,7 +257,9 @@ test-projects/
   mixed/
     monorepo/                mendr.toml with a Cargo and an npm project, [[ignore]], --write
   gradle/
-    ...                      added with the Gradle milestone
+    direct-bump/             version in libs.versions.toml, --write
+    override/                BOM-managed dependency -> constraints {}, --write
+    build-break/
 ```
 
 Each scenario contains the project (with its **committed lockfile**), an `osv/` directory with
@@ -351,15 +372,23 @@ Constraints to keep in mind:
 - [x] pnpm in the flake's dev shell
 - [ ] Direct bumps of dependencies declared through catalogs (edit `pnpm-workspace.yaml`)
 
-### M5 — Gradle adapter
-- [ ] Graph via injected init script that dumps the resolved graph as JSON
-- [ ] Find where a version is declared: build files, `libs.versions.toml`, `ext`, BOMs
-- [ ] Apply direct bump / BOM bump; override via `constraints {}`
-- [ ] `ManifestNotEditable` when the declaration can't be located
-- [ ] Fixtures under `test-projects/gradle/`
-- [ ] CI: add JDK to fixture job
+### M5 — Gradle adapter (dependency locking required)
+- [x] Detect (build/settings script + a `gradle.lockfile`; without one: "no supported project
+      with a lockfile", like npm without `package-lock.json`)
+- [x] Graph from the project lockfiles + declarations + POM dependencies (deps.dev), no Gradle run
+- [x] Version semantics: Maven `ComparableVersion` port + Gradle notation
+- [x] Find where a version is declared: build scripts (string/map notation, one level of
+      `val`/`def`/`ext`/`extra`/`gradle.properties` indirection), version catalogs
+- [x] Direct bump; override via a marked `constraints {}` block
+- [x] Lockfile update (`gradle dependencies --write-locks`) through `ApplyOptions::shell`
+- [x] `ManifestNotEditable` when the declaration can't be located; unversioned (BOM-managed)
+      declarations fall through to override
+- [x] Fixtures under `test-projects/gradle/`
+- [x] CI: Gradle + JDK in the dev shell
+- [ ] BOM/platform bumps, relock via `--update-locks`, plugin classpath lockfiles
 
 ### Later
+- [ ] Gradle builds without dependency locking
 - [ ] Go adapter
 - [ ] Flutter/Dart adapter
 - [ ] yarn support

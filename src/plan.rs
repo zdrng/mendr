@@ -6,8 +6,8 @@
 //!    path, i.e. the dependency a local manifest declares (`via == P` when
 //!    `P` itself is direct). Each `(advisory, P@v, via)` is one [`Finding`]
 //!    with up to [`MAX_PATHS`] of its paths. Only a via declared by a root
-//!    (the project's own manifests, not a path/git dependency's) can be
-//!    bumped.
+//!    (the project's own manifests, not a path/git dependency's) with a
+//!    version of its own (a non-empty requirement) can be bumped.
 //! 2. Classifies advisories: active `[[ignore]]` -> `skipped:ignored`; below
 //!    `min-severity` -> `skipped:below_min_severity`.
 //! 3. Computes fix candidates for `P`: released versions > `v`, not yanked,
@@ -593,7 +593,9 @@ impl<'a> Planner<'a> {
                     .collect();
                 Group {
                     via,
-                    editable: g.edges_to(via).any(|e| g.roots.contains(&e.from)),
+                    editable: g
+                        .edges_to(via)
+                        .any(|e| g.roots.contains(&e.from) && !e.req.as_str().is_empty()),
                     parent_reqs,
                     corridor,
                     paths,
@@ -1631,6 +1633,27 @@ mod tests {
         );
         assert_eq!(
             finding.change,
+            Some(Change::Override {
+                package: "p".into(),
+                from: v("1.0.0"),
+                to: v("1.0.1")
+            })
+        );
+    }
+
+    #[test]
+    fn via_declared_without_a_version_is_not_bumped() {
+        // app -> a (version managed elsewhere, e.g. a Gradle platform) -> p.
+        let mut f = Fake::new();
+        let root = f.root("app", "0.1.0");
+        let a = f.dep(root, "a", "1.0.0", "");
+        f.dep(a, "p", "1.0.0", "=1.0.0");
+        f.publish("a", "1.0.0", &[("p", "=1.0.0")]);
+        f.publish("a", "1.1.0", &[("p", "^1.0.1")]);
+        f.publish("p", "1.0.0", &[]).publish("p", "1.0.1", &[]);
+        let plan = run(&f, &[adv("A-1", "p", "0", "1.0.1")], &policy());
+        assert_eq!(
+            only(&plan).change,
             Some(Change::Override {
                 package: "p".into(),
                 from: v("1.0.0"),

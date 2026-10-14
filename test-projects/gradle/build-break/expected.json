@@ -1,0 +1,16 @@
+{
+  "mode": "full",
+  "args": ["--allow-major"],
+  "exit_code": 1,
+  "findings": [
+    {
+      "advisory": "GHSA-mvr2-9pj6-7w5j",
+      "package": "com.google.guava:guava",
+      "version": "19.0",
+      "via": "com.google.guava:guava",
+      "strategy": "direct_bump",
+      "target": { "package": "com.google.guava:guava", "to": "24.1.1-android" },
+      "outcome": "failed:build_failed"
+    }
+  ]
+}

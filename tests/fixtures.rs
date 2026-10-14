@@ -99,7 +99,10 @@ fn copy_dir(from: &Path, to: &Path) {
     for entry in std::fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name();
-        if name == "node_modules" || name == "target" {
+        if matches!(
+            name.to_str(),
+            Some("node_modules" | "target" | "build" | ".gradle")
+        ) {
             continue;
         }
         let (src, dst) = (entry.path(), to.join(&name));
@@ -258,6 +261,7 @@ fn run_scenario(dir: &Path) -> Result<(), String> {
         .env("CARGO_HOME", cache.join("cargo"))
         .env("npm_config_cache", cache.join("npm"))
         .env("pnpm_config_store_dir", cache.join("pnpm-store"))
+        .env("GRADLE_USER_HOME", cache.join("gradle"))
         .env("MENDR_CACHE_DIR", cache.join("mendr"));
     // Toolchain setup from the dev shell (compiler wrappers, SDK paths, TLS
     // trust roots), not secrets. `NIX_CONFIG` can hold access tokens.
@@ -267,6 +271,7 @@ fn run_scenario(dir: &Path) -> Result<(), String> {
             || matches!(
                 name,
                 "SSL_CERT_FILE"
+                    | "JAVA_HOME"
                     | "SDKROOT"
                     | "DEVELOPER_DIR"
                     | "MACOSX_DEPLOYMENT_TARGET"

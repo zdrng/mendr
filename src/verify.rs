@@ -1,6 +1,6 @@
 //! Verification of planned changes.
 //!
-//! 1. Copy `project.path` to a temp dir: top-level `eco.copy_excludes()`
+//! 1. Copy `project.path` to a temp dir: `eco.copy_excludes()`
 //!    and `.git` / `node_modules` at any depth ([`SKIP_ANYWHERE`]) are
 //!    skipped; symlinks are recreated only when they resolve inside the
 //!    project (absolute ones are re-pointed into the copy), all others are
@@ -17,7 +17,7 @@
 //! 3. For each change in `plan.changes` (in order), on top of the changes
 //!    kept so far: snapshot the files `apply` may touch (named like one of
 //!    `eco.manifest_files()`, at any depth; all files if empty) ->
-//!    `eco.apply(copy, change, &ApplyOptions { release_cutoff })`
+//!    `eco.apply(copy, change, &ApplyOptions { release_cutoff, shell })`
 //!    (error -> `AdapterError::to_fail_reason`)
 //!    -> record the files `apply` changed -> `eco.resolve_graph(copy)` ->
 //!    release-age check on every registry package version that is new in the
@@ -29,9 +29,10 @@
 //!    install/build/test (`InstallFailed`/`BuildFailed`/`TestFailed`/`Timeout`).
 //!    Keep on success, otherwise restore the snapshotted files (other state
 //!    the commands left behind stays, see 4). A failing change never
-//!    stops the others. A change whose `package@from` is no longer in the
-//!    graph (moved by an earlier kept change) is not applied: it is kept if
-//!    the rescan shows its findings fixed, else `StillVulnerable`.
+//!    stops the others. A change whose findings an earlier kept change
+//!    already fixed is not applied and kept. Nor is one whose `package@from`
+//!    is no longer in the graph (moved by an earlier kept change): it is
+//!    kept if the rescan shows its findings fixed, else `StillVulnerable`.
 //! 4. Because changes are applied cumulatively, the last kept change was
 //!    already built and tested together with all earlier kept ones. Only if
 //!    a later attempt was reverted after its commands ran (they may have left
@@ -61,7 +62,7 @@ use anyhow::{Context, Result};
 use jiff::Timestamp;
 
 use crate::config::{IgnoreRule, Policy, ProjectConfig};
-use crate::ecosystem::{ApplyOptions, Commands, Ecosystem};
+use crate::ecosystem::{AdapterError, ApplyOptions, Commands, Ecosystem, Shell};
 use crate::model::{Change, DepGraph, FailReason, NodeId, Outcome, Step, log_tail};
 use crate::osv::{self, Advisory, Osv};
 use crate::plan::{Finding, ProjectPlan};
@@ -149,14 +150,18 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
             .iter()
             .filter(|f| matches!(&f.outcome, Outcome::Planned { change: c, .. } if c == change))
             .collect();
-        if current
-            .graph
-            .find(change.package(), change.from())
-            .is_none()
+        let still = check_still_vulnerable(ctx.eco, &findings, &current);
+        if still.is_ok()
+            || current
+                .graph
+                .find(change.package(), change.from())
+                .is_none()
         {
-            // An earlier kept change already moved `package@from` (same
-            // vulnerable node, or a bump that also moved it): nothing to apply.
-            match check_still_vulnerable(ctx.eco, &findings, &current) {
+            // An earlier kept change already fixed the findings (e.g. a
+            // Gradle bump through another direct dependency raised the one
+            // shared version) or moved `package@from` (same vulnerable node,
+            // or a bump that also moved it): nothing to apply.
+            match still {
                 Ok(()) => {
                     step.done("Kept", format!("{change} (done by an earlier change)"));
                     kept.push(change.clone());
@@ -355,6 +360,7 @@ fn apply_and_check(
 ) -> Result<(Scan, ChangedFiles), FailReason> {
     let opts = ApplyOptions {
         release_cutoff: release_cutoff(ctx),
+        shell: Some(&CopyShell(ctx)),
     };
     ctx.eco
         .apply(work, change, &opts)
@@ -646,6 +652,37 @@ fn run_steps(ctx: &VerifyContext, dir: &Path, baseline: bool) -> Result<(), Fail
     Ok(())
 }
 
+/// [`Shell`] for `apply`: [`run_shell`] with the project's timeout, sandbox
+/// and [`Ecosystem::command_env`].
+struct CopyShell<'a>(&'a VerifyContext<'a>);
+
+impl Shell for CopyShell<'_> {
+    fn run(&self, dir: &Path, command: &str) -> Result<(), AdapterError> {
+        let ctx = self.0;
+        let env = ctx.eco.command_env();
+        let (exit_code, stderr_tail) = match run_shell(dir, command, &env, ctx.timeout, ctx.sandbox)
+        {
+            Run::Ok => return Ok(()),
+            Run::Failed {
+                exit_code,
+                log_tail,
+            } => (exit_code, log_tail),
+            Run::TimedOut {
+                after_secs,
+                log_tail,
+            } => (
+                None,
+                format!("{log_tail}\n[mendr] timed out after {after_secs}s"),
+            ),
+        };
+        Err(AdapterError::Command {
+            command: command.to_string(),
+            exit_code,
+            stderr_tail,
+        })
+    }
+}
+
 /// `sh -c command` in `dir` with stdin closed and stdout+stderr captured
 /// together, in its own process group. When the command exits, times out
 /// or mendr is interrupted, the whole group is killed, so nothing it
@@ -904,19 +941,31 @@ pub fn catch_interrupt<T>(f: impl FnOnce() -> T) -> Result<T, Interrupted> {
 /// install trees (recreated by the install step).
 const SKIP_ANYWHERE: &[&str] = &[".git", "node_modules"];
 
-/// Whether the walk skips the entry `name` in a directory at `depth` (0 =
-/// the project root).
-fn skipped(name: &std::ffi::OsStr, depth: usize, excludes: &[&str]) -> bool {
-    SKIP_ANYWHERE.iter().any(|e| name == *e) || (depth == 0 && excludes.iter().any(|e| name == *e))
+/// Whether the walk skips the entry at `rel` (relative to the project
+/// root): one of [`SKIP_ANYWHERE`], or one of the `excludes` (paths
+/// relative to the root, e.g. `target`, `buildSrc/build`).
+fn skipped(rel: &Path, excludes: &[&str]) -> bool {
+    rel.file_name()
+        .is_some_and(|name| SKIP_ANYWHERE.iter().any(|e| name == *e))
+        || excludes.iter().any(|e| rel == Path::new(e))
 }
 
-/// Copy the directory `from` to `to` (created), skipping the top-level
-/// `excludes` and [`SKIP_ANYWHERE`]. A symlink is recreated only if it
+/// Whether the file name `name` matches a `manifest_files` entry: equal, or
+/// ending in the rest of a `*suffix` pattern.
+fn name_matches(name: &std::ffi::OsStr, pattern: &str) -> bool {
+    match pattern.strip_prefix('*') {
+        Some(suffix) => name.to_str().is_some_and(|n| n.ends_with(suffix)),
+        None => name == pattern,
+    }
+}
+
+/// Copy the directory `from` to `to` (created), skipping the `excludes`
+/// and [`SKIP_ANYWHERE`]. A symlink is recreated only if it
 /// resolves inside `from` (absolute targets are re-pointed into `to`) and
 /// skipped otherwise. Other special files are skipped.
 fn copy_tree(from: &Path, to: &Path, excludes: &[&str]) -> io::Result<()> {
     let root = from.canonicalize()?;
-    copy_dir(&root, &root, to, to, excludes, 0)
+    copy_dir(&root, &root, to, to, excludes)
 }
 
 fn copy_dir(
@@ -925,19 +974,17 @@ fn copy_dir(
     dst_root: &Path,
     dst: &Path,
     excludes: &[&str],
-    depth: usize,
 ) -> io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
-        let name = entry.file_name();
-        if skipped(&name, depth, excludes) {
+        let (s, d) = (entry.path(), dst.join(entry.file_name()));
+        if skipped(s.strip_prefix(root).expect("below root"), excludes) {
             continue;
         }
-        let (s, d) = (entry.path(), dst.join(&name));
         let kind = entry.file_type()?;
         if kind.is_dir() {
-            copy_dir(root, &s, dst_root, &d, excludes, depth + 1)?;
+            copy_dir(root, &s, dst_root, &d, excludes)?;
         } else if kind.is_file() {
             fs::copy(&s, &d)?;
         } else if kind.is_symlink() {
@@ -991,7 +1038,7 @@ fn snapshot(tracked: Tracked, dir: &Path) -> io::Result<Snapshot> {
         let wanted = names.is_empty()
             || rel
                 .file_name()
-                .is_some_and(|n| names.iter().any(|m| n == *m));
+                .is_some_and(|n| names.iter().any(|m| name_matches(n, m)));
         if wanted {
             let content = fs::read(dir.join(&rel))?;
             out.insert(rel, content);
@@ -1031,32 +1078,32 @@ fn restore(tracked: Tracked, dir: &Path, snap: &Snapshot) -> io::Result<()> {
 }
 
 /// Relative paths of regular files (symlinks are not followed) below `root`,
-/// skipping the top-level `excludes` and [`SKIP_ANYWHERE`].
+/// skipping the `excludes` and [`SKIP_ANYWHERE`].
 fn list_files(root: &Path, excludes: &[&str]) -> io::Result<BTreeSet<PathBuf>> {
     fn walk(
         root: &Path,
         dir: &Path,
         excludes: &[&str],
-        depth: usize,
         out: &mut BTreeSet<PathBuf>,
     ) -> io::Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
-            if skipped(&entry.file_name(), depth, excludes) {
+            let path = entry.path();
+            let rel = path.strip_prefix(root).expect("below root");
+            if skipped(rel, excludes) {
                 continue;
             }
             let kind = entry.file_type()?;
             if kind.is_dir() {
-                walk(root, &entry.path(), excludes, depth + 1, out)?;
+                walk(root, &path, excludes, out)?;
             } else if kind.is_file() {
-                let path = entry.path();
-                out.insert(path.strip_prefix(root).expect("below root").to_path_buf());
+                out.insert(rel.to_path_buf());
             }
         }
         Ok(())
     }
     let mut out = BTreeSet::new();
-    walk(root, root, excludes, 0, &mut out)?;
+    walk(root, root, excludes, &mut out)?;
     Ok(out)
 }
 
@@ -1648,6 +1695,38 @@ mod tests {
         assert_eq!(kept_lock(&r), vec!["a@1.0.0", "p@1.0.1", "b@1.0.0"]);
     }
 
+    #[test]
+    fn change_whose_findings_are_already_fixed_is_not_applied() {
+        // p@1.0.0 via a (^1.0: relock) and via b (=1.0.0: bump b to 1.1.0).
+        // The relock moves the shared node; b@1.0.0 is still locked, but
+        // its finding is gone, so the bump is not applied.
+        let mut s = setup();
+        let mut fake = Fake::new();
+        let root = fake.root("app", "0.1.0");
+        let a = fake.dep(root, "a", "1.0.0", "^1");
+        let p = fake.dep(a, "p", "1.0.0", "^1.0");
+        let b = fake.dep(root, "b", "1.0.0", "^1.0.0");
+        fake.graph
+            .add_edge(b, p, crate::model::VersionReq::new("=1.0.0"));
+        fake.publish("a", "1.0.0", &[("p", "^1.0")]);
+        fake.publish("b", "1.0.0", &[("p", "=1.0.0")]);
+        fake.publish("b", "1.1.0", &[("p", "^1.0.1")]);
+        fake.publish("p", "1.0.0", &[]).publish("p", "1.0.1", &[]);
+        s.fake = fake;
+        let r = run(&s);
+        let strategies: Vec<_> = r.plan.changes.iter().map(Change::strategy).collect();
+        assert_eq!(
+            strategies,
+            [
+                crate::model::Strategy::Relock,
+                crate::model::Strategy::DirectBump
+            ]
+        );
+        assert_eq!(r.labels(), labels(&[("p", "fixed"), ("p", "fixed")]));
+        assert_eq!(s.fake.applied.borrow().len(), 1, "bump not applied");
+        assert_eq!(kept_lock(&r), vec!["a@1.0.0", "p@1.0.1", "b@1.0.0"]);
+    }
+
     /// Whether process `pid` still exists, waiting up to 5s for it to go.
     fn still_alive(pid: libc::pid_t) -> bool {
         let start = Instant::now();
@@ -1867,9 +1946,12 @@ mod tests {
 
         let dst = tempfile::tempdir().unwrap();
         let copy = dst.path().join("c");
-        copy_tree(&p, &copy, &["target"]).unwrap();
+        fs::create_dir_all(p.join("tool/target")).unwrap();
+        copy_tree(&p, &copy, &["target", "tool/target"]).unwrap();
         assert!(!copy.join("target").exists());
-        assert!(copy.join("src/target").is_dir(), "only top-level excludes");
+        assert!(!copy.join("tool/target").exists());
+        assert!(copy.join("tool").is_dir());
+        assert!(copy.join("src/target").is_dir(), "excludes are paths");
         for skipped in [".git", "node_modules", "web/node_modules", "sub/.git"] {
             assert!(!copy.join(skipped).exists(), "{skipped} copied");
         }
@@ -1897,7 +1979,7 @@ mod tests {
         }
         let tracked = Tracked {
             excludes: &["target"],
-            names: &["m.lock", "m.toml"],
+            names: &["m.lock", "*.toml"],
         };
         let snap = snapshot(tracked, d).unwrap();
         assert_eq!(

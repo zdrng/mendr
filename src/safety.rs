@@ -9,7 +9,7 @@
 //! - credential files readable under `HOME` (SSH private keys, also in
 //!   subfolders of `~/.ssh`, cloud, registry and Git credentials, see
 //!   [`CREDENTIAL_FILES`]) or named by environment variables (`CARGO_HOME`,
-//!   `DOCKER_CONFIG`, `KUBECONFIG`, `XDG_CONFIG_HOME`, ...);
+//!   `DOCKER_CONFIG`, `GRADLE_USER_HOME`, `KUBECONFIG`, `XDG_CONFIG_HOME`, ...);
 //! - a Git credential helper in the system/global Git config (a build can
 //!   ask it for tokens with `git credential fill`);
 //! - secret-looking environment variables (see [`is_secret_var`]) and
@@ -22,8 +22,8 @@
 //!   machine sockets, Docker context endpoints);
 //! - every path in `SafetyConfig::deny_paths` (`~/` expanded) that is readable;
 //! - in the project itself ([`check_project`]; these files are copied into
-//!   the temp copy): an `.npmrc`/`.yarnrc.yml` with a registry token and
-//!   `.env` / `.env.*` files.
+//!   the temp copy): an `.npmrc`/`.yarnrc.yml` with a registry token, a
+//!   `gradle.properties` with credentials and `.env` / `.env.*` files.
 //!
 //! With `--sandbox` builds run in a container that sees none of the host
 //! ([`crate::sandbox`]), so only the project checks run
@@ -155,8 +155,29 @@ const CREDENTIAL_FILES: &[(&str, Cred, &str)] = &[
     ),
     (".azure", Cred::Dir, "Azure CLI credentials"),
     (".pypirc", Cred::Any, "PyPI credentials"),
+    (
+        ".gradle/gradle.properties",
+        Cred::Contains(GRADLE_SECRETS),
+        "Gradle repository or signing credentials",
+    ),
+    (
+        ".m2/settings.xml",
+        Cred::Contains(&["<password>", "<passphrase>", "<privateKey>"]),
+        "Maven repository credentials",
+    ),
+    (
+        ".m2/settings-security.xml",
+        Cred::Any,
+        "Maven master password",
+    ),
     (".gem/credentials", Cred::Any, "RubyGems credentials"),
     (".gnupg/private-keys-v1.d", Cred::Dir, "GnuPG private keys"),
+];
+
+/// Markers of credentials in a `gradle.properties` (`mavenPassword`,
+/// `signing.keyId`, `githubToken`, `gpr.key`, ...).
+const GRADLE_SECRETS: &[&str] = &[
+    "assword", "ASSWORD", "ecret", "ECRET", "oken", "OKEN", "signing.", "Key=", "key=", ".key",
 ];
 
 /// Variables naming a credential file (or `:`-separated list of files).
@@ -207,6 +228,11 @@ pub fn check_project(dir: &Path, env: &Environment) -> Vec<Violation> {
     for (name, kind, what) in [
         (".npmrc", Cred::NpmAuth, "an npm registry token"),
         (".yarnrc.yml", Cred::Contains(&["npmAuth"]), "a Yarn token"),
+        (
+            "gradle.properties",
+            Cred::Contains(GRADLE_SECRETS),
+            "Gradle repository or signing credentials",
+        ),
     ] {
         let path = dir.join(name);
         if credential_matches(&path, kind, env) {
@@ -410,6 +436,13 @@ fn credential_files(env: &Environment, out: &mut Vec<Violation>) {
             Path::new(dir).join("config.json"),
             Cred::DockerConfig,
             "Docker registry credentials",
+        );
+    }
+    if let Some(dir) = env.var("GRADLE_USER_HOME") {
+        found(
+            Path::new(dir).join("gradle.properties"),
+            Cred::Contains(GRADLE_SECRETS),
+            "Gradle repository or signing credentials",
         );
     }
     if let Some(file) = env.var("NPM_CONFIG_USERCONFIG") {
@@ -1091,6 +1124,57 @@ mod tests {
         assert!(details[0].contains(".npmrc holds an npm registry token"));
         assert!(details[1].contains("/.env may hold secrets"));
         assert!(details[2].contains("/.env.local may hold secrets"));
+    }
+
+    #[test]
+    fn gradle_and_maven_credentials_are_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let project = tempfile::tempdir().unwrap();
+        let p = project.path();
+        let e = env(h, &[]);
+        write(
+            &h.join(".gradle/gradle.properties"),
+            "org.gradle.caching=true\n",
+        );
+        write(
+            &h.join(".m2/settings.xml"),
+            "<settings><mirrors/></settings>\n",
+        );
+        write(&p.join("gradle.properties"), "org.gradle.jvmargs=-Xmx2g\n");
+        assert_eq!(
+            checks(&check_with(&SafetyConfig::default(), &e)),
+            Vec::<&str>::new()
+        );
+        assert_eq!(check_project(p, &e), vec![]);
+
+        write(
+            &h.join(".gradle/gradle.properties"),
+            "ossrhPassword=hunter2\n",
+        );
+        write(
+            &h.join(".m2/settings.xml"),
+            "<server><password>x</password></server>\n",
+        );
+        write(&p.join("gradle.properties"), "signing.keyId=ABCD\n");
+        let gradle_home = tempfile::tempdir().unwrap();
+        write(&gradle_home.path().join("gradle.properties"), "gpr.key=x\n");
+        let e = env(
+            h,
+            &[("GRADLE_USER_HOME", gradle_home.path().to_str().unwrap())],
+        );
+        let details: Vec<String> = check_with(&SafetyConfig::default(), &e)
+            .into_iter()
+            .map(|v| v.detail)
+            .collect();
+        assert_eq!(details.len(), 3, "{details:#?}");
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains(".gradle/gradle.properties"))
+        );
+        assert!(details.iter().any(|d| d.contains(".m2/settings.xml")));
+        assert_eq!(checks(&check_project(p, &e)), vec!["project-file"]);
     }
 
     #[test]

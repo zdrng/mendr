@@ -20,8 +20,8 @@ For each vulnerable package version, mendr takes the cheapest step the policy al
    style.
 3. **override**: force the fixed version through the package manager's override mechanism
    (npm `overrides`, scoped to the vulnerable versions; pnpm `overrides` in
-   `pnpm-workspace.yaml`, scoped to the packages that depend on the vulnerable version). Not
-   available for Cargo.
+   `pnpm-workspace.yaml`, scoped to the packages that depend on the vulnerable version; Gradle
+   `constraints {}` in the projects that lock the vulnerable version). Not available for Cargo.
 4. **give up with a reason**: e.g. `no_patched_version`, `no_parent_version_fixes`,
    `major_bump_blocked`, `release_too_recent`.
 
@@ -41,10 +41,10 @@ Then, unless `--plan-only`, mendr copies the project to a temp dir and:
 
 ## Install and run
 
-Toolchains come from the Nix flake (Rust, Node 22, pnpm):
+Toolchains come from the Nix flake (Rust, Node 22, pnpm, Gradle, JDK 21):
 
 ```sh
-nix develop                  # shell with cargo, node, npm, pnpm
+nix develop                  # shell with cargo, node, npm, pnpm, gradle, java
 cargo install --path .       # or: cargo build --release && ./target/release/mendr
 ```
 
@@ -123,7 +123,7 @@ timeout = "20m"              # per command; default and "0": no timeout
 
 [[project]]
 path = "apps/web"
-ecosystem = "npm"            # optional: cargo | npm | pnpm
+ecosystem = "npm"            # optional: cargo | npm | pnpm | gradle
 install = "npm ci --ignore-scripts"   # override the default commands per step
 build = "npm run build"
 test = "npm test"
@@ -162,6 +162,7 @@ Default commands:
 | cargo | - | `cargo build --locked --all-targets` | `cargo test --locked` |
 | npm | `npm ci --no-audit --no-fund` | `npm run build` if `scripts.build` exists | `npm test` if a real `scripts.test` exists |
 | pnpm | `pnpm install --frozen-lockfile` | `pnpm run build` if `scripts.build` exists | `pnpm test` if a real `scripts.test` exists |
+| gradle | - | `./gradlew assemble --no-daemon --console=plain` (`gradle` without a wrapper) | `./gradlew test --no-daemon --console=plain` |
 
 ## Safety
 
@@ -174,8 +175,9 @@ build that project (it reports a project error, exit 2) if it finds any:
   `~/.aws/credentials`, `~/.npmrc` and pnpm `rc` tokens, `~/.cargo/credentials.toml`,
   `~/.docker/config.json` auths, `~/.config/gh/hosts.yml`, `~/.netrc`, `~/.git-credentials`,
   `~/.config/git/credentials`, `~/.kube/config`, gcloud/Azure/GnuPG/PyPI/RubyGems credentials,
-  ...) and files named by variables such as `CARGO_HOME`, `DOCKER_CONFIG`, `KUBECONFIG`,
-  `XDG_CONFIG_HOME`, `GOOGLE_APPLICATION_CREDENTIALS`;
+  passwords, tokens and signing keys in `~/.gradle/gradle.properties`, `~/.m2/settings.xml`
+  passwords, ...) and files named by variables such as `CARGO_HOME`, `DOCKER_CONFIG`,
+  `GRADLE_USER_HOME`, `KUBECONFIG`, `XDG_CONFIG_HOME`, `GOOGLE_APPLICATION_CREDENTIALS`;
 - a Git credential helper (`credential.helper`, e.g. `osxkeychain`, which Apple's Git sets
   system-wide) in the system or global Git config: a build can ask it for tokens with
   `git credential fill`;
@@ -190,8 +192,8 @@ build that project (it reports a project error, exit 2) if it finds any:
 - every readable path in `[safety] deny-paths`;
 - in the project itself, because it is copied into the build's temp dir: an `.npmrc` with an
   `_auth`/`_authToken`/`_password` value (a bare `${VAR}` counts only if `VAR` is set) or a
-  `.yarnrc.yml` with `npmAuth`, and `.env` / `.env.*` files (not `.example`, `.sample`,
-  `.template`).
+  `.yarnrc.yml` with `npmAuth`, a `gradle.properties` with credentials, and `.env` / `.env.*`
+  files (not `.example`, `.sample`, `.template`).
 
 Run mendr with `--sandbox` (below), run it where none of this is reachable (a container or CI job
 without secrets), use `--plan-only`, or accept the risk with `--allow-secrets` (mendr then
@@ -263,6 +265,7 @@ image = "docker.io/library/rust:1-slim"    # e.g. docker.io/library/node:22-slim
 | Cargo | `Cargo.toml` + `Cargo.lock` | relock, direct bump (incl. `[workspace.dependencies]`) |
 | npm | `package.json` + `package-lock.json` (v2/v3) or `npm-shrinkwrap.json` | relock, direct bump, override (incl. workspaces) |
 | pnpm | `package.json` + `pnpm-lock.yaml` (v9) | relock, direct bump, override (incl. workspaces) |
+| Gradle | `settings.gradle(.kts)` or `build.gradle(.kts)` + a `gradle.lockfile` (dependency locking) | direct bump (build scripts, version catalogs, `gradle.properties`), override (`constraints {}`) |
 
 Limitations:
 
@@ -283,8 +286,18 @@ Limitations:
   that registry packages declare, so they are fetched once per package version from the registry
   (and cached). A project that has both `package-lock.json` and `pnpm-lock.yaml` is detected as
   npm; set `ecosystem = "pnpm"` to choose pnpm.
-- Not supported yet: yarn lockfiles, Gradle, Go, Flutter/Dart (planned, see
-  [PLAN.md](PLAN.md)).
+- Gradle: the build must use [dependency locking](https://docs.gradle.org/current/userguide/dependency_locking.html):
+  add `dependencyLocking { lockAllConfigurations() }` to every project and run
+  `./gradlew dependencies --write-locks` once. The lockfile has no dependency tree, so mendr
+  rebuilds it from the build's declarations and each locked version's POM (from
+  [deps.dev](https://deps.dev), which covers Maven Central; modules from other repositories
+  are scanned but get no edges). A change rewrites the lockfiles with
+  `gradle dependencies --write-locks`, which runs the build scripts, so it happens only during
+  verification, after the safety checks (inside the container with `--sandbox`; the image needs
+  a JDK and, without a wrapper, Gradle). A dependency declared without a version (managed by a
+  platform/BOM or a plugin) is fixed with an override, not by bumping the BOM. Plugin
+  classpaths (`buildscript-gradle.lockfile`) are not scanned; there is no relock.
+- Not supported yet: yarn lockfiles, Go, Flutter/Dart (planned, see [PLAN.md](PLAN.md)).
 
 OSV responses and registry metadata are cached under `$MENDR_CACHE_DIR`,
 `$XDG_CACHE_HOME/mendr` or `~/.cache/mendr` (empty variables are ignored; without `HOME`, a
