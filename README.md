@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/banner-dark.gif">
+  <img alt="mendr" src="docs/banner.gif">
+</picture>
+
 # mendr
 
 mendr finds known vulnerabilities in a project's dependencies (via [OSV](https://osv.dev)) and
