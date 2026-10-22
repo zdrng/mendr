@@ -161,9 +161,20 @@ Default commands:
 ## What verification runs
 
 Verification runs untrusted code (build scripts, install scripts and test suites of new
-dependency versions) with your user's permissions and environment. mendr does not isolate it:
-use `--plan-only`, or run mendr in an isolated environment (a container, a VM, a CI job without
-secrets) when that matters.
+dependency versions) with your user's permissions and environment. mendr does not isolate it
+itself; run it in a sandbox. We recommend [MXC](https://github.com/microsoft/mxc): on macOS it
+sandboxes mendr and everything it starts without root or a daemon.
+[`examples/mxc/`](examples/mxc/README.md) has ready policies for an npm and a Rust project that
+block everything except the project, the toolchain and a scratch directory (no access to `~/.ssh`,
+`~/.aws`, other repositories or the host environment):
+
+```sh
+mkdir -p ~/.mendr-sandbox/tmp
+mxc-exec-mac examples/mxc/npm.json > report.md   # after adjusting the paths in the policy
+```
+
+Other options: a container, a VM, a CI job without secrets, or `--plan-only` (runs no project
+code).
 
 The temp copy leaves out `.git` and every `node_modules`. Commands run in their own process
 group, which is killed when the command ends (no background process survives it). On Ctrl-C,

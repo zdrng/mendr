@@ -1,0 +1,24 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/mxc/main/schemas/stable/mxc-config.schema.1.0.0.json",
+  "_comment": "mendr for one npm/pnpm project on macOS. Readable: the project, mendr and Node. Writable: the project and ~/.mendr-sandbox. Everything else, including the host environment, is blocked. Replace /Users/me/... with your paths, see README.md.",
+  "version": "1.0.0",
+  "containment": "seatbelt",
+  "process": {
+    "commandLine": "mendr --format markdown",
+    "cwd": "/Users/me/src/web-app",
+    "env": [
+      "PATH=/Users/me/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      "HOME=/Users/me/.mendr-sandbox",
+      "TMPDIR=/Users/me/.mendr-sandbox/tmp",
+      "TERM=xterm-256color"
+    ]
+  },
+  "filesystem": {
+    "readwritePaths": ["/Users/me/src/web-app", "/Users/me/.mendr-sandbox"],
+    "readonlyPaths": ["/Users/me/.cargo/bin", "/opt/homebrew"]
+  },
+  "network": {
+    "egress": { "default": "allow" },
+    "ingress": { "default": "deny", "hostLoopback": "deny" }
+  }
+}
