@@ -23,6 +23,10 @@
             pkgs.clippy
             pkgs.rustfmt
             pkgs.rust-analyzer
+            # Security checks (README, "Development")
+            pkgs.cargo-audit
+            pkgs.cargo-deny
+            pkgs.cargo-geiger
             pkgs.nodejs_22
             pkgs.pnpm
             pkgs.gradle

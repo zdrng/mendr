@@ -262,11 +262,24 @@ times with backoff. `[osv] api` or `MENDR_OSV_API` replaces the OSV API base URL
 
 ```sh
 nix develop -c cargo fmt --check
-nix develop -c cargo clippy --all-targets -- -D warnings
-nix develop -c cargo test                                   # unit tests, offline
+nix develop -c cargo clippy --locked --all-targets -- -D warnings
+nix develop -c cargo test --locked                          # unit tests, offline
 nix develop -c cargo test --test fixtures -- --ignored      # end to end, needs network
 MENDR_FIXTURE=npm/override nix develop -c cargo test --test fixtures -- --ignored
 ```
+
+Security checks, all in CI (`ci.yml` on every push, `audit.yml` daily for new advisories):
+
+```sh
+nix develop -c cargo audit                                  # known vulnerabilities (RustSec)
+nix develop -c cargo deny --locked check advisories bans sources   # deny.toml
+nix develop -c scripts/geiger.sh                            # unsafe code in mendr and its dependencies (report only)
+nix develop -c scripts/check-reproducible.sh                # release build twice, must be bit for bit identical
+```
+
+Release builds are reproducible: `--locked`, the toolchain pinned by `flake.lock`, one codegen
+unit and no symbols (`[profile.release]`), and the script remaps the source, target and Cargo
+home directories so no machine paths end up in the binary.
 
 The fixtures in [`test-projects/`](test-projects/README.md) are small real projects with known
 vulnerable dependencies, one directory per scenario (relock, direct bump, override, no fix, a fix

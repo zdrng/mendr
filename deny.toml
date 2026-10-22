@@ -1,0 +1,18 @@
+# cargo-deny: advisories, yanked crates, wildcard versions and sources.
+# Run: nix develop -c cargo deny check advisories bans sources
+# Licenses are not checked: mendr itself has no license yet.
+
+[advisories]
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml (unmaintained) via serde_yaml_ng, which parses pnpm-lock.yaml. No known vulnerability; replace the YAML parser when one is reported." },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

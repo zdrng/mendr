@@ -1,0 +1,24 @@
+name: Audit
+
+# New advisories appear without any change to mendr: check every day.
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: cargo audit
+        run: nix develop -c cargo audit
+      - name: cargo deny (advisories)
+        run: nix develop -c cargo deny --locked check advisories

@@ -17,3 +17,10 @@ thiserror = "2.0.21"
 toml = "1.1.6"
 toml_edit = "0.25.15"
 ureq = { version = "3.4.2", features = ["json"] }
+
+# Reproducible release builds (scripts/check-reproducible.sh adds --locked and
+# path remapping): one codegen unit, no symbols.
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
