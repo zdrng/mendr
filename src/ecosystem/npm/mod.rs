@@ -19,8 +19,8 @@
 //!   npm's `ERESOLVE` (peer conflicts), `EOVERRIDE` and `ETARGET` errors
 //!   become [`AdapterError::ResolutionConflict`].
 //! - Verification commands: `npm ci` (with install scripts: verification runs
-//!   build and test code anyway, inside the sandbox the safety checks
-//!   require, and many packages need their install scripts), then
+//!   build and test code anyway, and many packages need their install
+//!   scripts), then
 //!   `npm run build` / `npm test` when the project defines them.
 
 mod lockfile;

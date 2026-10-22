@@ -16,8 +16,8 @@
 //!   project that locks the vulnerable version (see [`constraints`]). Both
 //!   then rewrite the lockfiles with `gradle dependencies --write-locks`,
 //!   which runs the build scripts, so it goes through
-//!   [`ApplyOptions::shell`] (after the safety checks, inside the sandbox
-//!   with `--sandbox`). Relock is unsupported: declared versions are exact.
+//!   [`ApplyOptions::shell`]. Relock is unsupported: declared versions are
+//!   exact.
 //! - `ApplyOptions::release_cutoff` is ignored: Gradle cannot resolve by
 //!   publish time. Verification's release-age check on the lockfile diff
 //!   guards new transitive versions.

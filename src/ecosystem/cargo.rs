@@ -790,11 +790,6 @@ impl Ecosystem for Cargo {
         &["Cargo.toml", "Cargo.lock"]
     }
 
-    fn sandbox_env(&self) -> &'static [(&'static str, &'static str)] {
-        // The official images set CARGO_HOME inside the image.
-        &[("CARGO_HOME", ".cargo")]
-    }
-
     fn releases(&self, package: &str) -> Result<Vec<Release>, AdapterError> {
         let entries = self.entries(package)?;
         let mut dates = HashMap::new();

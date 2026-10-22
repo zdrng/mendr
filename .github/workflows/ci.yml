@@ -29,8 +29,7 @@ jobs:
   # vulnerable projects, so untrusted build scripts). Rust, Node, pnpm, Gradle
   # and the JDK come from the flake's dev shell. The harness already clears the
   # environment and uses an empty HOME; this job additionally keeps secrets off
-  # the machine so mendr's safety checks pass without --allow-secrets (never
-  # set MENDR_FIXTURE_ALLOW_SECRETS here).
+  # the machine.
   fixtures:
     runs-on: ubuntu-latest
     timeout-minutes: 30

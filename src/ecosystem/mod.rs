@@ -152,9 +152,9 @@ impl From<crate::http::HttpError> for AdapterError {
 }
 
 /// Runs a shell command line in a project copy the way verification runs
-/// install/build/test: own process group, the project's timeout, inside the
-/// container with `--sandbox`. For adapters whose lockfile update runs
-/// project code (Gradle's build scripts).
+/// install/build/test: own process group, the project's timeout. For
+/// adapters whose lockfile update runs project code (Gradle's build
+/// scripts).
 pub trait Shell {
     /// `sh -c command` in `dir`; a non-zero exit or a timeout is an
     /// [`AdapterError::Command`] with the output's tail.
@@ -168,7 +168,7 @@ pub struct ApplyOptions<'a> {
     /// `None` when the release-age policy is disabled.
     pub release_cutoff: Option<jiff::Timestamp>,
     /// Where to run commands that execute project code. Verification
-    /// always sets it (after the safety checks passed); `None` in unit tests.
+    /// always sets it; `None` in unit tests.
     pub shell: Option<&'a dyn Shell>,
 }
 
@@ -253,18 +253,8 @@ pub trait Ecosystem {
         &[]
     }
 
-    /// Environment for commands run in a `--sandbox` container: variable
-    /// name and a path relative to the container's `HOME`, which lives as
-    /// long as one project's verification. For tools whose caches would
-    /// otherwise land in the image and be lost after every command. Empty
-    /// (the default) when the caches already live under `HOME`.
-    fn sandbox_env(&self) -> &'static [(&'static str, &'static str)] {
-        &[]
-    }
-
-    /// Extra environment for install/build/test commands, on the host and
-    /// in a `--sandbox` container (e.g. npm registry settings from
-    /// `mendr.toml`). Applied with [`set_env`]. Empty by default.
+    /// Extra environment for install/build/test commands (e.g. npm
+    /// registry settings from `mendr.toml`). Applied with [`set_env`]. Empty by default.
     fn command_env(&self) -> Vec<(String, String)> {
         Vec::new()
     }

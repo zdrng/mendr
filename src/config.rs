@@ -8,15 +8,6 @@
 //! min-severity = "low"          # low | medium | high | critical
 //! target = "minimal"            # or "latest-compatible"
 //!
-//! [safety]
-//! allow-secrets = false
-//! deny-paths = ["~/.aws"]       # extra paths that must not be readable
-//!                               # (`~/` = HOME, relative = config file dir)
-//!
-//! [sandbox]                     # used only with --sandbox; both keys required
-//! engine = "docker"             # docker | podman
-//! image = "docker.io/library/rust:1"
-//!
 //! [npm]                         # npm projects; both keys optional
 //! registry = "https://registry.npmjs.org/"
 //! replace-registry-host = "always"   # npmjs | always | never | <host>
@@ -136,44 +127,6 @@ pub struct IgnoreRule {
     pub expires: Option<jiff::civil::Date>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct SafetyConfig {
-    /// Run builds even if safety checks fail (`--allow-secrets`).
-    pub allow_secrets: bool,
-    /// Extra paths that must not be readable. `~` / `~/...` are expanded by
-    /// the safety check; other relative paths are joined onto the config
-    /// file's directory when the config is parsed.
-    pub deny_paths: Vec<String>,
-}
-
-/// Container engine for `--sandbox`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Engine {
-    Docker,
-    Podman,
-}
-
-impl Engine {
-    /// The CLI program.
-    pub fn program(self) -> &'static str {
-        match self {
-            Engine::Docker => "docker",
-            Engine::Podman => "podman",
-        }
-    }
-}
-
-/// `[sandbox]`: run install/build/test in a container. No defaults: the
-/// section needs both keys, and only `--sandbox` turns it on.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SandboxConfig {
-    pub engine: Engine,
-    pub image: String,
-    /// Set by `--sandbox`; never by the file.
-    pub enabled: bool,
-}
-
 /// `[npm]`: registry settings for npm projects. No tokens: those stay in
 /// `.npmrc` outside the project or in environment variables.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -232,9 +185,6 @@ pub struct Config {
     /// The config file that was loaded, if any.
     pub file: Option<PathBuf>,
     pub policy: Policy,
-    pub safety: SafetyConfig,
-    /// `[sandbox]`, if the file has one.
-    pub sandbox: Option<SandboxConfig>,
     pub npm: NpmConfig,
     pub osv: OsvConfig,
     pub projects: Vec<ProjectConfig>,
@@ -245,9 +195,7 @@ pub struct Config {
 #[derive(Clone, Debug, Default)]
 pub struct Overrides {
     pub allow_major: bool,
-    pub allow_secrets: bool,
     pub min_release_age: Option<String>,
-    pub sandbox: bool,
 }
 
 #[derive(Deserialize)]
@@ -255,9 +203,6 @@ pub struct Overrides {
 struct RawConfig {
     #[serde(default)]
     policy: RawPolicy,
-    #[serde(default)]
-    safety: RawSafety,
-    sandbox: Option<RawSandbox>,
     #[serde(default)]
     npm: RawNpm,
     #[serde(default)]
@@ -276,22 +221,6 @@ struct RawPolicy {
     min_release_age: Option<String>,
     min_severity: Option<SeverityLevel>,
     target: Option<TargetPolicy>,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-struct RawSafety {
-    #[serde(default)]
-    allow_secrets: bool,
-    #[serde(default)]
-    deny_paths: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-struct RawSandbox {
-    engine: Engine,
-    image: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -381,15 +310,6 @@ fn replace_registry_host(s: &str) -> Result<String> {
     Ok(s.to_string())
 }
 
-/// `~` and `~/...` stay as they are (the safety check expands them against
-/// `HOME`); other relative paths are joined onto `base_dir`.
-fn resolve_deny_path(path: String, base_dir: &Path) -> String {
-    if path == "~" || path.starts_with("~/") || Path::new(&path).is_absolute() {
-        return path;
-    }
-    base_dir.join(&path).to_string_lossy().into_owned()
-}
-
 fn parse_expires(v: &toml::Value) -> Result<jiff::civil::Date> {
     let text = match v {
         toml::Value::Datetime(dt) => {
@@ -415,8 +335,6 @@ impl Config {
             base_dir: base_dir.to_path_buf(),
             file: None,
             policy: Policy::default(),
-            safety: SafetyConfig::default(),
-            sandbox: None,
             npm: NpmConfig::default(),
             osv: OsvConfig::default(),
             projects: vec![ProjectConfig::at(base_dir.to_path_buf())],
@@ -500,20 +418,6 @@ impl Config {
             base_dir: base_dir.to_path_buf(),
             file: None,
             policy,
-            safety: SafetyConfig {
-                allow_secrets: raw.safety.allow_secrets,
-                deny_paths: raw
-                    .safety
-                    .deny_paths
-                    .into_iter()
-                    .map(|p| resolve_deny_path(p, base_dir))
-                    .collect(),
-            },
-            sandbox: raw.sandbox.map(|s| SandboxConfig {
-                engine: s.engine,
-                image: s.image,
-                enabled: false,
-            }),
             npm,
             osv,
             projects,
@@ -557,22 +461,8 @@ impl Config {
         if o.allow_major {
             self.policy.allow_major = true;
         }
-        if o.allow_secrets {
-            self.safety.allow_secrets = true;
-        }
         if let Some(age) = &o.min_release_age {
             self.policy.min_release_age = parse_duration(age).context("--min-release-age")?;
-        }
-        if o.sandbox {
-            let Some(sandbox) = &mut self.sandbox else {
-                bail!(
-                    "--sandbox needs a [sandbox] section with `engine` and `image` in {}",
-                    self.file
-                        .as_deref()
-                        .map_or(CONFIG_FILE.into(), |f| f.display().to_string())
-                );
-            };
-            sandbox.enabled = true;
         }
         Ok(())
     }
@@ -587,11 +477,6 @@ impl Config {
             if self.policy.strategies[..i].contains(s) {
                 bail!("policy.strategies lists `{s}` twice");
             }
-        }
-        if let Some(s) = &self.sandbox
-            && s.image.trim().is_empty()
-        {
-            bail!("sandbox.image must not be empty");
         }
         for p in &self.projects {
             if let Some(e) = &p.ecosystem
@@ -630,9 +515,6 @@ min-release-age = "12h"
 min-severity = "medium"
 target = "latest-compatible"
 
-[safety]
-deny-paths = ["~/.aws"]
-
 [[project]]
 path = "apps/web"
 test = "npm test"
@@ -665,7 +547,6 @@ expires = "2027-01-02"
         assert_eq!(c.policy.min_release_age, Duration::from_secs(12 * 3600));
         assert_eq!(c.policy.min_severity, SeverityLevel::Medium);
         assert_eq!(c.policy.target, TargetPolicy::LatestCompatible);
-        assert_eq!(c.safety.deny_paths, vec!["~/.aws"]);
         assert_eq!(c.projects.len(), 2);
         assert_eq!(c.projects[0].path, PathBuf::from("/repo/apps/web"));
         assert_eq!(c.projects[0].test.as_deref(), Some("npm test"));
@@ -708,13 +589,10 @@ expires = "2027-01-02"
         let mut c = Config::parse("[policy]\nmin-release-age = \"7d\"\n", Path::new("/r")).unwrap();
         c.apply_overrides(&Overrides {
             allow_major: true,
-            allow_secrets: true,
             min_release_age: Some("0".into()),
-            sandbox: false,
         })
         .unwrap();
         assert!(c.policy.allow_major);
-        assert!(c.safety.allow_secrets);
         assert_eq!(c.policy.min_release_age, Duration::ZERO);
         assert!(
             c.apply_overrides(&Overrides {
@@ -723,49 +601,6 @@ expires = "2027-01-02"
             })
             .is_err()
         );
-    }
-
-    #[test]
-    fn sandbox_needs_both_keys_and_the_flag() {
-        let text = "[sandbox]\nengine = \"podman\"\nimage = \"docker.io/library/rust:1\"\n";
-        let mut c = Config::parse(text, Path::new("/r")).unwrap();
-        let s = c.sandbox.clone().unwrap();
-        assert_eq!(s.engine, Engine::Podman);
-        assert_eq!(s.image, "docker.io/library/rust:1");
-        assert!(!s.enabled, "only --sandbox turns it on");
-        c.apply_overrides(&Overrides {
-            sandbox: true,
-            ..Overrides::default()
-        })
-        .unwrap();
-        assert!(c.sandbox.unwrap().enabled);
-
-        for bad in [
-            "[sandbox]\nengine = \"docker\"\n",
-            "[sandbox]\nimage = \"x\"\n",
-            "[sandbox]\nengine = \"lxc\"\nimage = \"x\"\n",
-            "[sandbox]\nengine = \"docker\"\nimage = \"x\"\nnetwork = \"none\"\n",
-        ] {
-            assert!(Config::parse(bad, Path::new("/r")).is_err(), "{bad}");
-        }
-        let c = Config::parse(
-            "[sandbox]\nengine = \"docker\"\nimage = \" \"\n",
-            Path::new("/r"),
-        )
-        .unwrap();
-        assert!(c.validate(&[]).is_err());
-    }
-
-    #[test]
-    fn sandbox_flag_without_section_fails() {
-        let mut c = Config::default_at(Path::new("/r"));
-        let err = c
-            .apply_overrides(&Overrides {
-                sandbox: true,
-                ..Overrides::default()
-            })
-            .unwrap_err();
-        assert!(err.to_string().contains("[sandbox] section"), "{err}");
     }
 
     #[test]
@@ -914,29 +749,6 @@ api = "https://osv.intern.example/v1"
             let c = Config::parse(&text, Path::new("/r")).unwrap();
             assert_eq!(c.projects[0].timeout, None, "{zero}");
         }
-    }
-
-    #[test]
-    fn deny_paths_are_relative_to_the_config_file() {
-        let c = Config::parse(
-            r#"
-[safety]
-deny-paths = ["~", "~/.aws", "/etc/x", "secrets", "./a/b", "~x"]
-"#,
-            Path::new("/repo"),
-        )
-        .unwrap();
-        assert_eq!(
-            c.safety.deny_paths,
-            vec![
-                "~",
-                "~/.aws",
-                "/etc/x",
-                "/repo/secrets",
-                "/repo/./a/b",
-                "/repo/~x"
-            ]
-        );
     }
 
     #[test]

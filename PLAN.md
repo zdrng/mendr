@@ -13,7 +13,8 @@ and every attempt ends in a structured result with a reason.
 - **One trait per ecosystem.** Each ecosystem is one module implementing `Ecosystem`. Planning,
   rules and reporting never know which ecosystem they run on.
 - **Never touch the user's checkout.** All changes happen in a temporary copy.
-- **Safe by default.** Refuse to run builds when secrets are reachable, unless explicitly allowed.
+- **Isolation is not mendr's job.** Verification runs dependency code with the user's permissions;
+  run mendr in an isolated environment when that matters, or use `--plan-only`.
 - **Native tools are the source of truth.** After every change, resolve the graph again and rescan.
 
 ## How a run works
@@ -22,9 +23,8 @@ and every attempt ends in a structured result with a reason.
 2. For each project: detect the ecosystem, resolve the dependency graph, look up vulnerabilities in OSV.
 3. Plan: for each vulnerable package, pick the cheapest strategy the rules allow:
    `relock` → `direct bump` → `override` → give up with a reason.
-4. Unless `--plan-only` or nothing is planned: run the safety checks (host and project; with
-   `--sandbox` only project), copy the project, run a baseline build/test, then apply each change,
-   build, test, and keep or revert it.
+4. Unless `--plan-only` or nothing is planned: copy the project, run a baseline build/test, then
+   apply each change, build, test, and keep or revert it.
 5. Print the report (JSON or Markdown).
 
 ## Module layout
@@ -36,8 +36,6 @@ src/
   model.rs           Version, DepGraph, Change, Outcome, reasons
   osv.rs             OSV client, cache, snapshot loading, range matching, alias dedupe
   rules.rs           release age, major bumps, severity, ignore list (plain fns)
-  safety.rs          secret and escape-route checks
-  sandbox.rs         --sandbox: install/build/test in Docker/Podman containers
   plan.rs            fix planning (ecosystem-agnostic)
   verify.rs          temp copy, baseline, apply, build, test, revert
   report.rs          JSON + Markdown output
@@ -65,14 +63,6 @@ min-release-age = "7d"       # default 7d; "0" disables
 min-severity = "medium"      # default "low" (everything)
 target = "minimal"           # or "latest-compatible"
 
-[safety]
-allow-secrets = false
-deny-paths = ["~/.aws"]
-
-[sandbox]                    # only with --sandbox; both keys required, no defaults
-engine = "podman"            # docker | podman
-image = "docker.io/library/rust:1-slim"
-
 [[project]]
 path = "apps/web"            # ecosystem auto-detected
 test = "npm test"
@@ -90,7 +80,7 @@ reason = "not reachable"
 expires = 2026-12-31
 ```
 
-CLI overrides: `--allow-major`, `--allow-secrets`, `--sandbox`, `--min-release-age <dur>`,
+CLI overrides: `--allow-major`, `--min-release-age <dur>`,
 `--plan-only`, `--format json|markdown`, `--osv-snapshot <dir>`, `--output <file>`, `--write`, `--config <path>`.
 Without a config file mendr uses the defaults and one auto-detected project in the current
 directory. Full reference: the doc comment at the top of `src/config.rs`.
@@ -186,14 +176,13 @@ tags: `{"kind": "skipped", "reason": {"kind": "no_parent_version_fixes", ...}}`.
   - `satisfies` treats a plain version as exact (what a fresh resolution picks for a POM pin),
     so relocks never apply; `shared_copies` is true (one version per configuration).
   - apply edits the build files, then runs `gradle dependencies --write-locks` through
-    `ApplyOptions::shell` (the build scripts run, so only during verification, after the
-    safety checks, sandboxed with `--sandbox`). "Cannot find a version of" / "Could not find"
+    `ApplyOptions::shell` (the build scripts run, so only during verification). "Cannot find a version of" / "Could not find"
     -> `ResolutionConflict`.
   - Gradle resolves conflicts to the highest version, so a bump through one direct dependency
     often fixes the findings of another via too; verification keeps such later changes
     without applying them.
 
-### Verification and safety (M3)
+### Verification (M3)
 
 - Changes are applied **cumulatively** in one temp copy, in `plan.changes` order: each change is
   verified on top of the changes kept so far and reverted (snapshot restore) on failure. The last
@@ -220,21 +209,6 @@ tags: `{"kind": "skipped", "reason": {"kind": "no_parent_version_fixes", ...}}`.
 - Commands run as `sh -c` in the copy with mendr's environment, stdin `/dev/null`, stdout+stderr
   combined into the log tail. A timeout kills the command's whole process group. A baseline
   timeout is reported as `baseline_failed` (`exit_code: null`, log tail says "timed out").
-- `--sandbox` (`sandbox.rs`) changes only how `run_shell` starts a command: `docker|podman run
-  --rm --init` per command (the container stops with `sh`, so background processes die like the
-  process group does without it), mounting only the copy and a per-project temp `HOME` at their
-  host paths, no host env, own user (`--user uid:gid` / `--userns=keep-id`), `--cap-drop=ALL`,
-  `no-new-privileges`. Caches outlive single commands through that `HOME`;
-  `Ecosystem::sandbox_env` points tools whose image keeps them elsewhere (Cargo: `CARGO_HOME`)
-  into it. On timeout/interrupt the container is removed (`rm --force`), since killing the CLI
-  does not stop it. `Sandbox::check` runs before the copy: engine running, image pullable, temp
-  dir visible in the container (macOS VMs share only some dirs). Resolving and `apply` stay on
-  the host: they run no project code. With `--sandbox` only the project safety checks run.
-- Safety checks look for danger, not isolation: credential files under `HOME` and named by env
-  vars (`CARGO_HOME`, `DOCKER_CONFIG`, `KUBECONFIG`, ...), secret-looking env var names
-  (values never printed), a reachable SSH agent, a reachable Docker/Podman socket or a
-  non-unix `DOCKER_HOST`, readable `deny-paths`. CI's fixture job runs on a runner VM with no
-  checkout credentials, no Nix access token and Docker stopped.
 
 ## Test projects
 
@@ -283,12 +257,9 @@ Constraints to keep in mind:
 - **Security alerts noise.** GitHub/Dependabot will flag the intentionally vulnerable lockfiles.
   Exclude `test-projects/` from Dependabot and dismiss alerts for it.
 - **Fixtures run untrusted build scripts.** Fixable scenarios run in full mode (build + test). CI
-  runs them on a runner VM with no secrets and Docker stopped, so mendr's own safety checks pass
-  without `--allow-secrets`; this doubles as a test of the safety checks. The harness passes
+  runs them on a runner VM with no secrets and Docker stopped. The harness passes
   only `PATH`, an empty `HOME`, cache dirs and the dev shell's toolchain variables (`NIX_*` except
-  `NIX_CONFIG`, `SDKROOT`, `CC`, ...; needed to link on macOS). Locally,
-  `MENDR_FIXTURE_ALLOW_SECRETS=1` adds `--allow-secrets` for machines with a reachable
-  container socket. `expected.json` can check file contents after `--write` (`files`).
+  `NIX_CONFIG`, `SDKROOT`, `CC`, ...; needed to link on macOS). `expected.json` can check file contents after `--write` (`files`).
 - **Pick vulnerable packages carefully.** Old, well-known advisories with stable fixes, no install
   scripts, exact versions pinned in the lockfile. Verify each scenario actually reproduces.
 
@@ -312,7 +283,7 @@ Constraints to keep in mind:
 - [x] Unit tests for planner and rules using the fake ecosystem
 - [x] `report.rs`: JSON output
 - [x] `tests/fixtures.rs` harness + `test-projects/README.md` (`expected.json` format)
-- [x] `safety.rs` / `verify.rs` stubs with documented signatures (filled in by M3)
+- [x] `verify.rs` stub with documented signatures (filled in by M3)
 
 ### M2 — Cargo adapter
 - [x] Detect (`Cargo.toml` + `Cargo.lock`)
@@ -326,9 +297,7 @@ Constraints to keep in mind:
 - [x] Register in `src/ecosystem/mod.rs` (`pub mod cargo;` + one line in `ecosystems()`)
 - [x] Fixtures: `cargo/relock`, `cargo/direct-bump`, `cargo/no-fix`
 
-### M3 — Verification and safety
-- [x] `safety.rs`: credential files, secret env vars, Docker socket, configurable deny paths
-- [x] Refuse to run unless checks pass or `--allow-secrets`
+### M3 — Verification
 - [x] `verify.rs`: temp copy, baseline build/test, apply, build, test, keep or revert
 - [x] Command timeouts
 - [x] Rescan after each change → `NewVulnerabilityIntroduced`
@@ -393,5 +362,4 @@ Constraints to keep in mind:
 - [ ] Flutter/Dart adapter
 - [ ] yarn support
 - [ ] SARIF output
-- [x] `--sandbox`: install/build/test in Docker/Podman containers (`[sandbox] engine`, `image`)
 - [ ] Scheduled CI job: fixtures against live OSV to catch advisory drift

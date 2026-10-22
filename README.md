@@ -83,13 +83,11 @@ the elapsed time and the current request or command:
 | flag | meaning |
 |------|---------|
 | `--config <PATH>` | config file (default: `./mendr.toml` if present) |
-| `--plan-only` | only plan fixes; no build, no test, no safety checks |
+| `--plan-only` | only plan fixes; no build, no test |
 | `--format json\|markdown` | report format (default `json`) |
 | `--output <FILE>` | write the report to a file instead of stdout |
 | `--osv-snapshot <DIR>` | read OSV records from `DIR/*.json` (one record per file, osv.dev schema) instead of the live API |
 | `--allow-major` | allow major version bumps (`[policy] allow-major`) |
-| `--allow-secrets` | run builds even when the safety checks find secrets the build could read, also with `--sandbox` (`[safety] allow-secrets`) |
-| `--sandbox` | run install/build/test in throwaway Docker/Podman containers (needs `[sandbox]`, see [Sandbox](#sandbox)) |
 | `--min-release-age <DUR>` | minimum age of any version mendr picks: `"7d"`, `"12h"`, `"20m"`, `"30s"`, `"0"` = off (`[policy] min-release-age`, default `7d`) |
 | `-q`, `--quiet` | print only warnings and errors on stderr |
 | `--write` | copy verified manifest/lockfile changes back into the project (not with `--plan-only`) |
@@ -106,14 +104,6 @@ allow-major = false          # allow major bumps of direct dependencies / overri
 min-release-age = "7d"       # "0" disables; versions without a known publish date count as too new
 min-severity = "low"         # low | medium | high | critical; unknown severity always passes
 target = "minimal"           # or "latest-compatible": highest fixed version without another major bump
-
-[safety]
-allow-secrets = false
-deny-paths = ["~/.aws", "/etc/secrets"]   # extra paths that must not be readable (`~/` = HOME)
-
-[sandbox]                    # only used with --sandbox; no defaults, both keys required
-engine = "docker"            # docker | podman
-image = "docker.io/library/rust:1"        # must contain the project's toolchain
 
 [npm]                        # npm projects; both keys optional
 registry = "https://registry.npmjs.org/"  # http(s) URL
@@ -151,14 +141,13 @@ expires = 2026-12-31         # optional, inclusive (UTC); afterwards the advisor
 Configured `[npm]` keys are passed to every npm process mendr starts as `npm_config_registry` /
 `npm_config_replace_registry_host` (replacing an upper-case `NPM_CONFIG_*` spelling): the
 `npm install --package-lock-only` that applies a change and the install, build and test commands,
-including commands set in `[[project]]` (they run through `sh`, so any `npm` they call sees them),
-also with `--sandbox`. Example: a `package-lock.json` whose `resolved` URLs point at a company
+including commands set in `[[project]]` (they run through `sh`, so any `npm` they call sees them).
+Example: a `package-lock.json` whose `resolved` URLs point at a company
 registry can be installed from the public one with `registry = "https://registry.npmjs.org/"`
 and `replace-registry-host = "always"` (npm then ignores the host in `resolved`).
 
 `mendr.toml` holds no credentials and has no token key. Registry tokens still come from an
-`.npmrc` outside the project or from environment variables, and the [safety checks](#safety)
-treat them as before.
+`.npmrc` outside the project or from environment variables.
 
 Default commands:
 
@@ -169,40 +158,12 @@ Default commands:
 | pnpm | `pnpm install --frozen-lockfile` | `pnpm run build` if `scripts.build` exists | `pnpm test` if a real `scripts.test` exists |
 | gradle | - | `./gradlew assemble --no-daemon --console=plain` (`gradle` without a wrapper) | `./gradlew test --no-daemon --console=plain` |
 
-## Safety
+## What verification runs
 
-Verification runs untrusted code: build scripts, install scripts and test suites of new
-dependency versions. Before building anything for a project (only when it has changes to verify;
-never with `--plan-only`), mendr looks for secrets that this code could read and refuses to
-build that project (it reports a project error, exit 2) if it finds any:
-
-- credential files under `HOME` (SSH private keys, also in subfolders of `~/.ssh`,
-  `~/.aws/credentials`, `~/.npmrc` and pnpm `rc` tokens, `~/.cargo/credentials.toml`,
-  `~/.docker/config.json` auths, `~/.config/gh/hosts.yml`, `~/.netrc`, `~/.git-credentials`,
-  `~/.config/git/credentials`, `~/.kube/config`, gcloud/Azure/GnuPG/PyPI/RubyGems credentials,
-  passwords, tokens and signing keys in `~/.gradle/gradle.properties`, `~/.m2/settings.xml`
-  passwords, ...) and files named by variables such as `CARGO_HOME`, `DOCKER_CONFIG`,
-  `GRADLE_USER_HOME`, `KUBECONFIG`, `XDG_CONFIG_HOME`, `GOOGLE_APPLICATION_CREDENTIALS`;
-- a Git credential helper (`credential.helper`, e.g. `osxkeychain`, which Apple's Git sets
-  system-wide) in the system or global Git config: a build can ask it for tokens with
-  `git credential fill`;
-- secret-looking environment variables (`*_TOKEN`, `*_SECRET`, `*PASSWORD`, `*_KEY`, ...) and
-  variables whose value holds a URL with a password (`scheme://user:pass@host`); values are
-  never printed;
-- an SSH agent (`SSH_AUTH_SOCK`) that holds at least one identity (or does not answer the
-  identity query; the empty agent macOS always provides is fine);
-- a reachable Docker/Podman socket (`/var/run/docker.sock`, `DOCKER_HOST`, rootless sockets,
-  Docker Desktop, OrbStack, Colima, Lima, Rancher Desktop and Podman machine sockets, unix
-  endpoints of Docker contexts), a non-unix `DOCKER_HOST` or Docker context endpoint;
-- every readable path in `[safety] deny-paths`;
-- in the project itself, because it is copied into the build's temp dir: an `.npmrc` with an
-  `_auth`/`_authToken`/`_password` value (a bare `${VAR}` counts only if `VAR` is set) or a
-  `.yarnrc.yml` with `npmAuth`, a `gradle.properties` with credentials, and `.env` / `.env.*`
-  files (not `.example`, `.sample`, `.template`).
-
-Run mendr with `--sandbox` (below), run it where none of this is reachable (a container or CI job
-without secrets), use `--plan-only`, or accept the risk with `--allow-secrets` (mendr then
-prints the list as a warning). The checks look for danger; they cannot prove isolation.
+Verification runs untrusted code (build scripts, install scripts and test suites of new
+dependency versions) with your user's permissions and environment. mendr does not isolate it:
+use `--plan-only`, or run mendr in an isolated environment (a container, a VM, a CI job without
+secrets) when that matters.
 
 The temp copy leaves out `.git` and every `node_modules`. Commands run in their own process
 group, which is killed when the command ends (no background process survives it). On Ctrl-C,
@@ -210,42 +171,6 @@ group, which is killed when the command ends (no background process survives it)
 128 + the signal number (130, 143, 129); a second signal exits at once. `--write` refuses to
 touch the project if a file it would write changed since mendr copied it, and replaces files by
 renaming temp files written next to them.
-
-### Sandbox
-
-With `--sandbox`, mendr runs every install, build and test command in a new container
-(`docker run --rm` / `podman run --rm`) of the `[sandbox]` image, so you do not have to set up an
-isolated environment yourself. The flag needs a `[sandbox]` section; there are no defaults:
-
-```toml
-[sandbox]
-engine = "podman"                          # docker | podman
-image = "docker.io/library/rust:1-slim"    # e.g. docker.io/library/node:22-slim for npm
-```
-
-- The container sees only the project's temp copy and a temp `HOME` for tool caches (npm, pnpm,
-  and the Cargo registry), both at the same paths as on the host, and removed after the project.
-  No environment variables, files or sockets of the host get in (only the configured `[npm]`
-  keys, as `npm_config_*`; a registry set only through a host variable does not reach the
-  container); it runs as your user (Podman: `--userns=keep-id`, so rootless Podman) with all
-  capabilities dropped. The network stays on: installs need the registries, which must be
-  reachable from the container (a registry on the host's `localhost` or behind a host-only VPN
-  or proxy may not be).
-- Scanning, planning, resolving the lockfile and `--write` still run on the host (they run no
-  project or dependency code), so the host still needs the package manager. The image's
-  toolchain should be at least as new as the host's (e.g. a newer host Cargo may write a
-  lockfile version an old image cannot read; the baseline then fails with the log).
-- The host checks above are skipped; the project checks (`.npmrc` tokens, `.env` files) still
-  run, because those files are copied into the container (`--allow-secrets` accepts them).
-- The temp dir must be visible inside the container. On macOS the engine runs in a VM that
-  shares only some host directories: the default `TMPDIR` (`/var/folders/...`) works with Docker
-  Desktop and Podman machines; with Colima, or inside `nix develop` (which sets `TMPDIR` to
-  `/tmp/nix-shell.*`), set `TMPDIR` to a shared directory. mendr checks this (and that the
-  engine runs and the image can be pulled) before the first command and explains a failure.
-- One config has one image: for a repository that mixes ecosystems use an image with all their
-  toolchains, or run mendr once per ecosystem with separate config files.
-- On a timeout or Ctrl-C mendr removes the running container. Its containers are labelled
-  `mendr` (`docker ps -a --filter label=mendr`).
 
 ## Output and exit codes
 
@@ -261,7 +186,7 @@ image = "docker.io/library/rust:1-slim"    # e.g. docker.io/library/node:22-slim
 |-----------|---------|
 | 0 | no unresolved findings: every finding is `fixed`, `planned` (`--plan-only`), `skipped:ignored` or `skipped:below_min_severity` |
 | 1 | unresolved findings remain |
-| 2 | error (bad config, safety refusal, a project could not be processed) |
+| 2 | error (bad config, a project could not be processed) |
 
 ## Supported ecosystems
 
@@ -298,8 +223,7 @@ Limitations:
   [deps.dev](https://deps.dev), which covers Maven Central; modules from other repositories
   are scanned but get no edges). A change rewrites the lockfiles with
   `gradle dependencies --write-locks`, which runs the build scripts, so it happens only during
-  verification, after the safety checks (inside the container with `--sandbox`; the image needs
-  a JDK and, without a wrapper, Gradle). A dependency declared without a version (managed by a
+  verification. A dependency declared without a version (managed by a
   platform/BOM or a plugin) is fixed with an override, not by bumping the BOM. Plugin
   classpaths (`buildscript-gradle.lockfile`) are not scanned; there is no relock.
 - Not supported yet: yarn lockfiles, Go, Flutter/Dart (planned, see [PLAN.md](PLAN.md)).
@@ -325,9 +249,7 @@ The fixtures in [`test-projects/`](test-projects/README.md) are small real proje
 vulnerable dependencies, one directory per scenario (relock, direct bump, override, no fix, a fix
 that breaks the build or the tests, a broken baseline, a two-project `mendr.toml`), each with its
 lockfile, a frozen OSV snapshot and an `expected.json`. The harness runs the `mendr` binary in an
-isolated environment (empty `HOME`, cleared env), so the safety checks pass without
-`--allow-secrets`. If a container daemon socket is reachable on your machine, stop it or set
-`MENDR_FIXTURE_ALLOW_SECRETS=1`.
+isolated environment (empty `HOME`, cleared env).
 
 ### Adding an ecosystem
 

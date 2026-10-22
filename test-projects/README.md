@@ -80,24 +80,9 @@ Isolation rules:
    toolchain variables when set: `NIX_*` (except `NIX_CONFIG`, which can hold
    tokens), `SSL_CERT_FILE`, `JAVA_HOME`, `SDKROOT`, `DEVELOPER_DIR`,
    `MACOSX_DEPLOYMENT_TARGET`, `CC`, `CXX`, `AR`, `AS`, `LD`, `NM`, `RANLIB`,
-   `STRIP` (needed to link on macOS). The empty `HOME` and cleared
-   environment are why mendr's safety checks pass without
-   `--allow-secrets`.
+   `STRIP` (needed to link on macOS).
 3. The exit code and the findings in the JSON report are compared with
    `expected.json`, then the `files` expectations are checked in the copy.
-
-Full-mode scenarios run real builds, so mendr's safety checks apply. The one
-check the harness cannot isolate is a container daemon socket
-(`/var/run/docker.sock`, `/run/podman/podman.sock`) that is reachable on the
-machine: mendr then refuses (exit 2). Stop the daemon, or opt in explicitly
-for local runs:
-
-```sh
-MENDR_FIXTURE_ALLOW_SECRETS=1 nix develop -c cargo test --test fixtures -- --ignored
-```
-
-With `MENDR_FIXTURE_ALLOW_SECRETS=1` the harness passes
-`--allow-secrets` to full-mode runs. CI never sets it.
 
 ## `expected.json`
 

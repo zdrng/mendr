@@ -8,9 +8,6 @@
 //! nix develop -c cargo test --test fixtures -- --ignored
 //! MENDR_FIXTURE=cargo/relock nix develop -c cargo test --test fixtures -- --ignored  # one scenario
 //! ```
-//!
-//! `MENDR_FIXTURE_ALLOW_SECRETS=1` passes `--allow-secrets` to
-//! full-mode runs (for machines with a reachable container daemon socket).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -242,19 +239,11 @@ fn run_scenario(dir: &Path) -> Result<(), String> {
     cmd.current_dir(&project)
         .args(["--format", "json", "--osv-snapshot"])
         .arg(project.join("osv"));
-    match expected.mode {
-        Mode::Plan => {
-            cmd.arg("--plan-only");
-        }
-        // Escape hatch for machines where mendr's safety checks fail even in
-        // the isolated environment (e.g. a reachable /var/run/docker.sock).
-        Mode::Full if std::env::var_os("MENDR_FIXTURE_ALLOW_SECRETS").is_some_and(|v| v == "1") => {
-            cmd.arg("--allow-secrets");
-        }
-        Mode::Full => {}
+    if let Mode::Plan = expected.mode {
+        cmd.arg("--plan-only");
     }
     cmd.args(&expected.args);
-    // Isolated environment: no secrets, fresh HOME, shared download caches.
+    // Isolated environment: fresh HOME, shared download caches.
     cmd.env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", &home)
