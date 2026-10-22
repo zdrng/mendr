@@ -6,29 +6,41 @@
 # mendr
 
 mendr finds known vulnerabilities in a project's dependencies (via [OSV](https://osv.dev)) and
-fixes them the way a developer would: with the smallest change that still builds and passes the
-tests. When the vulnerable package is a transitive dependency, it updates the direct dependency
-that pulls it in. Every fix is verified in a temporary copy of the project, and every finding ends
-with a result and a reason.
+fixes them the way a developer would, following your policy: which fix strategies to use and in
+which order, and whether to move to the smallest fixed version or the latest compatible one.
+When the vulnerable package is a transitive dependency, it updates the direct dependency that
+pulls it in. Every fix is verified in a temporary copy of the project (it must still build and
+pass the tests), and every finding ends with a result and a reason.
 
 mendr never touches your checkout unless you pass `--write`.
 
 ## How it fixes
 
-For each vulnerable package version, mendr takes the cheapest step the policy allows:
+For each vulnerable package version, mendr tries the strategies listed in
+`[policy] strategies`, in that order, and plans the first one that can fix it within the policy.
+By default all three are enabled, cheapest first:
 
 1. **relock**: only the lockfile changes. The parent's declared range already allows a fixed
    version (`cargo update -p smallvec@1.6.0 --precise 1.6.1`, npm re-resolving that copy, or
    pnpm pinning it for one resolution).
-2. **direct bump**: raise the requirement of the direct dependency in your manifest to the
-   smallest version that pulls in a fix (`tempfile = "3.3.0"` -> `"3.4.0"`), keeping the range
-   style.
+2. **direct bump**: raise the requirement of the direct dependency in your manifest to a
+   version that pulls in a fix (`tempfile = "3.3.0"` -> `"3.4.0"`), keeping the range style.
 3. **override**: force the fixed version through the package manager's override mechanism
    (npm `overrides`, scoped to the vulnerable versions; pnpm `overrides` in
    `pnpm-workspace.yaml`, scoped to the packages that depend on the vulnerable version; Gradle
    `constraints {}` in the projects that lock the vulnerable version). Not available for Cargo.
 4. **give up with a reason**: e.g. `no_patched_version`, `no_parent_version_fixes`,
    `major_bump_blocked`, `release_too_recent`.
+
+Leave a strategy out to never use it, e.g. `strategies = ["direct-bump"]` to only bump direct
+dependencies, or `["override", "direct-bump"]` to prefer overrides. If the planned change then
+fails verification, it is reported as failed; mendr does not fall back to the next strategy.
+
+`[policy] target` picks the version among those that fix the finding:
+
+- `minimal` (default): the smallest one (`tempfile` 3.3.0 -> 3.4.0);
+- `latest-compatible`: the highest one that is not a major bump from the smallest one
+  (`tempfile` 3.3.0 -> the newest 3.x, not 4.x), to update further while you are at it.
 
 Fix versions must be unaffected by every known advisory for the package, not yanked, not
 prereleases, and older than `min-release-age`. Major bumps are off unless allowed.
@@ -103,7 +115,7 @@ strategies = ["relock", "direct-bump", "override"]  # enabled strategies, in ord
 allow-major = false          # allow major bumps of direct dependencies / overrides
 min-release-age = "7d"       # "0" disables; versions without a known publish date count as too new
 min-severity = "low"         # low | medium | high | critical; unknown severity always passes
-target = "minimal"           # or "latest-compatible": highest fixed version without another major bump
+target = "minimal"           # smallest fixed version, or "latest-compatible": highest one without another major bump
 
 [npm]                        # npm projects; both keys optional
 registry = "https://registry.npmjs.org/"  # http(s) URL

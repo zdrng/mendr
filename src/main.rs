@@ -26,8 +26,9 @@ use crate::ecosystem::Ecosystem;
 use crate::osv::Osv;
 use crate::report::{Mode, ProjectReport, Report};
 
-/// Find known vulnerabilities (via OSV) and fix them with the smallest change
-/// that builds and passes tests. Never modifies the project unless --write.
+/// Find known vulnerabilities (via OSV) and fix them as [policy] in
+/// mendr.toml asks (strategies, smallest or latest compatible version),
+/// verified with build and tests. Never modifies the project unless --write.
 ///
 /// Exit codes: 0 = no unresolved vulnerabilities, 1 = unresolved
 /// vulnerabilities remain, 2 = error.

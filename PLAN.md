@@ -1,8 +1,9 @@
 # mendr — Plan
 
 mendr scans projects for known vulnerabilities (via [OSV](https://osv.dev)) and fixes them the way a
-developer would: take the smallest change that works, and when the vulnerable package is a transitive
-dependency, update the direct dependency that pulls it in. Every fix is verified with build and test,
+developer would, following the user's policy (which strategies in which order, smallest fixed or
+latest compatible version), and when the vulnerable package is a transitive dependency, update the
+direct dependency that pulls it in. Every fix is verified with build and test,
 and every attempt ends in a structured result with a reason.
 
 ## Principles
@@ -21,8 +22,9 @@ and every attempt ends in a structured result with a reason.
 
 1. Load `mendr.toml`, apply CLI flag overrides.
 2. For each project: detect the ecosystem, resolve the dependency graph, look up vulnerabilities in OSV.
-3. Plan: for each vulnerable package, pick the cheapest strategy the rules allow:
-   `relock` → `direct bump` → `override` → give up with a reason.
+3. Plan: for each vulnerable package, take the first of the enabled strategies (in their configured
+   order, default `relock` → `direct bump` → `override`) that the rules allow, else give up with a
+   reason. `target` picks the smallest fixed version or the latest compatible one.
 4. Unless `--plan-only` or nothing is planned: copy the project, run a baseline build/test, then
    apply each change, build, test, and keep or revert it.
 5. Print the report (JSON or Markdown).
@@ -62,7 +64,7 @@ strategies = ["relock", "direct-bump", "override"]  # order = preference
 allow-major = false
 min-release-age = "7d"       # default 7d; "0" disables
 min-severity = "medium"      # default "low" (everything)
-target = "minimal"           # or "latest-compatible"
+target = "minimal"           # smallest fixed version, or "latest-compatible"
 
 [[project]]
 path = "apps/web"            # ecosystem auto-detected
