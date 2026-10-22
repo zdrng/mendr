@@ -7,8 +7,8 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::semver::{Range, Ver};
 use crate::ecosystem::AdapterError;
+use crate::ecosystem::node_semver::{Range, Ver};
 
 /// A parsed JSON file plus the formatting needed to write it back.
 pub struct JsonFile {

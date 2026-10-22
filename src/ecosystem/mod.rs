@@ -23,6 +23,9 @@ use serde::{Deserialize, Serialize};
 use crate::config::NpmConfig;
 use crate::model::{BumpKind, Change, DepGraph, FailReason, Strategy, Version, VersionReq};
 
+/// node-semver rules for the npm and pnpm adapters.
+mod node_semver;
+
 // ---- Adapter modules (registration point 1 of 2) ---------------------------
 pub mod cargo;
 #[cfg(test)]

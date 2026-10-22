@@ -41,7 +41,6 @@ mod lockfile;
 mod manifest;
 mod overrides;
 mod registry;
-mod semver;
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -55,7 +54,7 @@ use serde_json::Value;
 use self::lockfile::Holder;
 use self::manifest::{JsonFile, SpecBump};
 use self::registry::{PackageInfo, Specs};
-use self::semver::{Range, Ver};
+use super::node_semver::{Range, Ver};
 use super::{AdapterError, ApplyOptions, Commands, DeclaredDep, Ecosystem, Release};
 use crate::model::{BumpKind, Change, DepGraph, Strategy, Version, VersionReq};
 

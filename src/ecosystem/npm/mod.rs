@@ -26,7 +26,6 @@
 mod lockfile;
 mod manifest;
 mod registry;
-mod semver;
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -39,7 +38,7 @@ use serde_json::Value;
 
 use self::manifest::{JsonFile, SpecBump};
 use self::registry::PackageInfo;
-use self::semver::{Range, Ver};
+use super::node_semver::{Range, Ver};
 use super::{AdapterError, ApplyOptions, Commands, DeclaredDep, Ecosystem, Release};
 use crate::config::NpmConfig;
 use crate::model::{BumpKind, Change, DepGraph, Strategy, Version, VersionReq};

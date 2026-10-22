@@ -44,8 +44,9 @@ src/
   ecosystem/
     mod.rs           Ecosystem trait + detection
     cargo.rs
-    npm/             lockfile, manifest, registry, semver
-    pnpm/            lockfile, manifest, overrides, registry, semver
+    node_semver.rs   node-semver rules, shared by npm and pnpm
+    npm/             lockfile, manifest, registry
+    pnpm/            lockfile, manifest, overrides, registry
     gradle/          lockfile, graph, declare, constraints, registry (deps.dev), version
     fake.rs          in-memory ecosystem for unit tests
 tests/
@@ -328,7 +329,7 @@ Constraints to keep in mind:
       ranges on registry edges from the version manifests (`GET <registry>/<name>/<version>`,
       cached forever)
 - [x] Registry: packument (versions, deps, `time`), cached under `pnpm`
-- [x] Version semantics: node-semver rules (own copy of the port)
+- [x] Version semantics: node-semver rules (the npm port, shared in `node_semver.rs`)
 - [x] Apply via pnpm (>= 10) with `--lockfile-only --ignore-scripts`, a non-strict
       `minimum-release-age` and `trust-lockfile`
 - [x] Relock by pinning the dependents for one install (parent-scoped overrides, exact importer

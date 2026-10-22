@@ -1,11 +1,11 @@
-//! node-semver rules, which pnpm resolves ranges with (a focused port,
+//! node-semver rules, shared by the npm and pnpm adapters (a focused port,
 //! strict mode, without `includePrerelease`): version parsing and ordering,
 //! and range matching with `^`, `~`, x-ranges (`1.x`, `*`), hyphen ranges
 //! (`1 - 2`), `||` and the prerelease rule.
 //!
-//! The `node-semver` crate is not used: it disagrees with node-semver on
-//! `<=1.2` / `<=1` and rejects the empty range. The unit tests below are a
-//! matrix generated with the `semver` package itself.
+//! The `node-semver` crate was evaluated and not used: it disagrees with
+//! npm on `<=1.2` / `<=1` and rejects the empty range. The unit tests below
+//! are a matrix generated with npm's own bundled `semver` package.
 
 use std::cmp::Ordering;
 
@@ -270,7 +270,7 @@ fn strip_v(s: &str) -> &str {
     s.trim_start_matches(['v', '='])
 }
 
-/// `A - B` -> `>=A <=B`, with partial versions widened as node-semver does.
+/// `A - B` -> `>=A <=B`, with partial versions widened as npm does.
 fn hyphen(from: &str, to: &str) -> Option<Vec<Comparator>> {
     let a = parse_partial(strip_v(from))?;
     let b = parse_partial(strip_v(to))?;
@@ -379,8 +379,8 @@ mod tests {
         "1.2.3-rc.1", "1.0.0-0",
     ];
 
-    /// `(range, the VERSIONS that semver.satisfies accepts)`, generated with
-    /// the `semver` package (v7).
+    /// `(range, the VERSIONS that npm's semver.satisfies accepts)`,
+    /// generated with the `semver` package bundled with npm 10.
     #[rustfmt::skip]
     const MATRIX: &[(&str, &[&str])] = &[
         ("^1.2.3", &["1.2.3", "1.2.4", "1.3.0", "1.4.0", "1.9.9"]),
@@ -446,7 +446,7 @@ mod tests {
     ];
 
     #[test]
-    fn matches_node_semver() {
+    fn matches_npm_semver() {
         for (range, accepted) in MATRIX {
             for v in VERSIONS {
                 assert_eq!(
