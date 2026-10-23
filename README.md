@@ -58,7 +58,24 @@ Then, unless `--plan-only`, mendr copies the project to a temp dir and:
 
 ## Install and run
 
-Toolchains come from the Nix flake (Rust, Node 22, pnpm, Gradle, JDK 21):
+Prebuilt binaries are on the [releases page](https://github.com/zdrng/mendr/releases): static
+Linux binaries (x86_64, aarch64), a macOS universal binary. Every
+asset is attested by the release workflow (SLSA build provenance, Sigstore), so you can check it
+was built by this repository's workflow from `main`, and it is reproducible
+(`scripts/release.sh`):
+
+```sh
+v=<version>; target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, universal-apple-darwin
+curl -fsSLO https://github.com/zdrng/mendr/releases/download/v$v/mendr-$v-$target.tar.gz
+gh attestation verify mendr-$v-$target.tar.gz --repo zdrng/mendr
+tar -xzf mendr-$v-$target.tar.gz
+install -m 0755 mendr-$v-$target/mendr ~/.local/bin/mendr
+```
+
+The binaries carry no operating system code signature. Downloaded with `curl` they just run; a
+browser download is quarantined by macOS (`xattr -d com.apple.quarantine mendr`).
+
+From source, the toolchains come from the Nix flake (Rust, Node 22, pnpm, Gradle, JDK 21):
 
 ```sh
 nix develop                  # shell with cargo, node, npm, pnpm, gradle, java
@@ -271,15 +288,22 @@ MENDR_FIXTURE=npm/override nix develop -c cargo test --test fixtures -- --ignore
 Security checks, all in CI (`ci.yml` on every push, `audit.yml` daily for new advisories):
 
 ```sh
+nix develop -c scripts/check.sh                             # fmt, clippy, tests, deny, audit: before every commit
 nix develop -c cargo audit                                  # known vulnerabilities (RustSec)
-nix develop -c cargo deny --locked check advisories bans sources   # deny.toml
+nix develop -c cargo deny --locked check                    # advisories, licenses, sources (deny.toml)
 nix develop -c scripts/geiger.sh                            # unsafe code in mendr and its dependencies (report only)
-nix develop -c scripts/check-reproducible.sh                # release build twice, must be bit for bit identical
+nix develop .#release -c scripts/release.sh reproduce x86_64-unknown-linux-musl dist   # release build twice, must be identical
 ```
 
 Release builds are reproducible: `--locked`, the toolchain pinned by `flake.lock`, one codegen
-unit and no symbols (`[profile.release]`), and the script remaps the source, target and Cargo
-home directories so no machine paths end up in the binary.
+unit and no symbols (`[profile.release]`), and `scripts/release.sh` remaps the source, target
+and Cargo home directories so no machine paths end up in the binary.
+
+Releasing: raise `version` in `Cargo.toml` on `main`, then Actions → Release → Run workflow
+(`release.yml`). It runs `scripts/check.sh`, builds every target twice
+(`scripts/release.sh reproduce`, which fails unless both builds are identical), attests the
+assets and creates the release with its tag `v<version>`; `dry-run` builds and checks without
+publishing. The workflow and `scripts/release.sh` are the same in mendr, pinr and lootr.
 
 The fixtures in [`test-projects/`](test-projects/README.md) are small real projects with known
 vulnerable dependencies, one directory per scenario (relock, direct bump, override, no fix, a fix
@@ -296,3 +320,8 @@ the two places marked in that file. Planning, verification and reporting are
 ecosystem-agnostic. `src/ecosystem/cargo.rs` is a compact example; the fake ecosystem in
 `src/ecosystem/fake.rs` shows the contract in unit tests. Add fixtures under
 `test-projects/<name>/`.
+
+## License
+
+GPL-3.0-only, see [LICENSE](LICENSE). Anyone may use mendr, also commercially; distributed
+modifications must be released under the same license.
