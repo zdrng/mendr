@@ -1,0 +1,165 @@
+name: Release test (temporary)
+
+# Manual release: Actions → Release → Run workflow, on main. Releases the
+# version in Cargo.toml from the current commit of main as v<version>:
+#
+#   prepare  checks (scripts/check.sh), SBOM, build matrix; fails if the tag
+#            already exists
+#   build    every target twice from two copies of the source; fails unless
+#            both results are bit for bit identical; then a smoke test
+#   publish  SHA256SUMS, one SLSA build provenance attestation (Sigstore) for
+#            all assets, then the release. The tag is created together with
+#            the release, so a failed run leaves no tag behind.
+#
+# "dry-run" builds and checks everything but publishes nothing; it also runs
+# from other branches. Anyone can rebuild an asset with scripts/release.sh
+# reproduce and compare it with SHA256SUMS, and verify where it came from:
+#
+#   gh attestation verify <asset> --repo <owner>/<repo>
+#
+# This file is the same in mendr, pinr and lootr. What differs (name,
+# targets, checks) lives in scripts/release.sh and scripts/check.sh.
+on:
+  push:
+    branches: [tmp-release-test]
+
+permissions: {}
+
+concurrency:
+  group: release-test
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      name: ${{ steps.meta.outputs.name }}
+      version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.meta.outputs.sha }}
+      matrix: ${{ steps.meta.outputs.matrix }}
+    steps:
+      - name: Releases only from main
+        if: ${{ false && github.ref != 'refs/heads/main' }}
+        run: |
+          echo "::error::start the release from main (other branches: dry-run only)"
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Version and targets
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          name=$(scripts/release.sh name)
+          version=$(scripts/release.sh version)
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Cargo.toml version $version is not a release version"
+            exit 1
+          fi
+          if gh api "repos/$REPO/git/ref/tags/v$version" >/dev/null 2>&1; then
+            echo "::error::v$version already exists: raise the version in Cargo.toml first"
+            exit 1
+          fi
+          {
+            echo "name=$name"
+            echo "version=$version"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "matrix=$(scripts/release.sh matrix)"
+          } >>"$GITHUB_OUTPUT"
+          echo "Releasing $name $version from $(git rev-parse HEAD)"
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: Checks
+        run: nix develop -c scripts/check.sh
+      - name: SBOM
+        run: nix develop .#release -c scripts/release.sh sbom dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Keep LF line endings: the scripts run in Git Bash.
+      - name: Git line endings
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        if: runner.os != 'Windows'
+      # Nix does not run on Windows: the same Rust version from rustup.
+      - name: Rust (Windows)
+        if: runner.os == 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          version=$(scripts/release.sh rust-version)
+          rustup toolchain install "$version" --profile minimal --target "$TARGET"
+          rustup default "$version"
+          rustc --version
+      - name: Build twice and compare
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then
+            scripts/release.sh reproduce "$TARGET" dist
+          else
+            nix develop .#release -c scripts/release.sh reproduce "$TARGET" dist
+          fi
+      - name: Smoke test
+        env:
+          TARGET: ${{ matrix.target }}
+        run: scripts/release.sh smoke "$TARGET" dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          version=$(sed -n 's/^ *releaseRust = "\(.*\)";$/\1/p' flake.nix)
+          rustup toolchain install "$version" --profile minimal --component clippy
+          rustup default "$version"
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+
