@@ -2,9 +2,10 @@
 //!
 //! Location (first that applies; empty variables are ignored):
 //! 1. `$MENDR_CACHE_DIR`
-//! 2. `$XDG_CACHE_HOME/mendr`
-//! 3. `$HOME/.cache/mendr`
-//! 4. `mendr-<uid>` (`mendr` off Unix) in the system temp directory
+//! 2. `mendr` in the user's cache directory: `$XDG_CACHE_HOME` or
+//!    `$HOME/.cache` on Unix, `%LOCALAPPDATA%` on Windows
+//!    ([`platform::user_cache_dir`])
+//! 3. `mendr-<uid>` (`mendr` on Windows) in the system temp directory
 //!
 //! Namespaces in use: `osv` (advisory records). Adapters should use their own
 //! namespace (`cargo-index`, `crates-io`, `npm`, `pnpm`). Cache failures are never
@@ -18,6 +19,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
+
+use crate::platform;
 
 /// Entries not rewritten for this long are deleted by [`prune`].
 const MAX_AGE: Duration = Duration::from_secs(30 * 86_400);
@@ -36,19 +39,12 @@ fn cache_dir_from(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     if let Some(dir) = var("MENDR_CACHE_DIR") {
         return PathBuf::from(dir);
     }
-    if let Some(dir) = var("XDG_CACHE_HOME") {
-        return PathBuf::from(dir).join("mendr");
-    }
-    if let Some(home) = var("HOME") {
-        return PathBuf::from(home).join(".cache").join("mendr");
+    if let Some(dir) = platform::user_cache_dir(var) {
+        return dir.join("mendr");
     }
     // Per user: the temp directory may be shared (`/tmp`), and another
     // user's cache must not feed us advisories.
-    #[cfg(unix)]
-    let name = format!("mendr-{}", unsafe { libc::getuid() });
-    #[cfg(not(unix))]
-    let name = "mendr".to_string();
-    std::env::temp_dir().join(name)
+    std::env::temp_dir().join(platform::temp_cache_name())
 }
 
 /// Turn an arbitrary key into a safe file name (`[A-Za-z0-9._-]`, others
@@ -245,15 +241,18 @@ mod tests {
             cache_dir_from(env(&[("MENDR_CACHE_DIR", "/c"), ("HOME", "/h")])),
             PathBuf::from("/c")
         );
-        assert_eq!(
-            cache_dir_from(env(&[("MENDR_CACHE_DIR", ""), ("XDG_CACHE_HOME", "/x")])),
-            PathBuf::from("/x/mendr")
-        );
-        assert_eq!(
-            cache_dir_from(env(&[("XDG_CACHE_HOME", ""), ("HOME", "/h")])),
-            PathBuf::from("/h/.cache/mendr")
-        );
-        let fallback = cache_dir_from(env(&[("HOME", "")]));
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                cache_dir_from(env(&[("MENDR_CACHE_DIR", ""), ("XDG_CACHE_HOME", "/x")])),
+                PathBuf::from("/x/mendr")
+            );
+            assert_eq!(
+                cache_dir_from(env(&[("XDG_CACHE_HOME", ""), ("HOME", "/h")])),
+                PathBuf::from("/h/.cache/mendr")
+            );
+        }
+        let fallback = cache_dir_from(env(&[("HOME", ""), ("LOCALAPPDATA", "")]));
         assert!(fallback.starts_with(std::env::temp_dir()));
         assert!(
             fallback

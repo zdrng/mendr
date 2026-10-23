@@ -185,7 +185,7 @@ Default commands:
 | cargo | - | `cargo build --locked --all-targets` | `cargo test --locked` |
 | npm | `npm ci --no-audit --no-fund` | `npm run build` if `scripts.build` exists | `npm test` if a real `scripts.test` exists |
 | pnpm | `pnpm install --frozen-lockfile` | `pnpm run build` if `scripts.build` exists | `pnpm test` if a real `scripts.test` exists |
-| gradle | - | `./gradlew assemble --no-daemon --console=plain` (`gradle` without a wrapper) | `./gradlew test --no-daemon --console=plain` |
+| gradle | - | `./gradlew assemble --no-daemon --console=plain` (`gradlew.bat` on Windows, `gradle` without a wrapper) | `./gradlew test --no-daemon --console=plain` |
 
 ## What verification runs
 
@@ -205,10 +205,13 @@ mxc-exec-mac examples/mxc/npm.json > report.md   # after adjusting the paths in 
 Other options: a container, a VM, a CI job without secrets, or `--plan-only` (runs no project
 code).
 
-The temp copy leaves out `.git` and every `node_modules`. Commands run in their own process
-group, which is killed when the command ends (no background process survives it). On Ctrl-C,
-`SIGTERM` or `SIGHUP` mendr stops the running command, removes the temp copy and exits with
-128 + the signal number (130, 143, 129); a second signal exits at once. `--write` refuses to
+The temp copy leaves out `.git` and every `node_modules`. Commands (the defaults below and those
+in `mendr.toml`) run in the system shell: `sh -c` on Linux and macOS, `cmd /C` on Windows, so
+write them in that shell's syntax. Each runs in its own process group (Windows: job object),
+which is killed when the command ends (no background process survives it). On Ctrl-C,
+`SIGTERM` or `SIGHUP` (Windows: Ctrl-C, Ctrl-Break, closing the console) mendr stops the running
+command, removes the temp copy and exits with 128 + the signal number (130, 143, 129); a second
+signal exits at once. `--write` refuses to
 touch the project if a file it would write changed since mendr copied it, and replaces files by
 renaming temp files written next to them.
 

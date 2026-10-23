@@ -13,6 +13,10 @@ and every attempt ends in a structured result with a reason.
 - **One binary crate** with modules. Split into a workspace only if it becomes painful.
 - **One trait per ecosystem.** Each ecosystem is one module implementing `Ecosystem`. Planning,
   rules and reporting never know which ecosystem they run on.
+- **One place for the operating system.** Everything OS-specific is in `src/platform`, behind
+  one interface with one implementation per platform (`unix.rs`, `windows.rs`); only the one for
+  the target is compiled. The rest of mendr never asks which system it runs on, and all `unsafe`
+  code is in those two files (`#![deny(unsafe_code)]` elsewhere).
 - **Never touch the user's checkout.** All changes happen in a temporary copy.
 - **Isolation is not mendr's job.** Verification runs dependency code with the user's permissions;
   run mendr in an isolated environment when that matters, or use `--plan-only`.
@@ -40,6 +44,12 @@ src/
   rules.rs           release age, major bumps, severity, ignore list (plain fns)
   plan.rs            fix planning (ecosystem-agnostic)
   verify.rs          temp copy, baseline, apply, build, test, revert
+  interrupt.rs       Ctrl-C/SIGTERM: deferred exit, unwind, exit code
+  platform/          everything OS-specific, one implementation compiled per target
+    mod.rs           the interface: shell, process tree, interrupt handlers, terminal,
+                     cache dir, permissions, symlinks, wrapper scripts, finding programs
+    unix.rs          sh -c, process groups, signals (Linux, macOS, BSD)
+    windows.rs       cmd /C, job objects, console control events
   report.rs          JSON + Markdown output
   cache.rs           on-disk cache (OSV records, adapter registry responses)
   http.rs            blocking HTTP helpers (ureq)
@@ -209,8 +219,9 @@ tags: `{"kind": "skipped", "reason": {"kind": "no_parent_version_fixes", ...}}`.
   advisory affects, is still reachable from a direct dependency named like its `via`.
   `new_vulnerability_introduced` = an (advisory id/alias, package) pair not present before the
   change, unless ignored or below `min-severity`.
-- Commands run as `sh -c` in the copy with mendr's environment, stdin `/dev/null`, stdout+stderr
-  combined into the log tail. A timeout kills the command's whole process group. A baseline
+- Commands run in the platform's shell (`sh -c`, Windows `cmd /D /S /C`) in the copy with
+  mendr's environment, stdin closed, stdout+stderr combined into the log tail. A timeout kills
+  the command's whole process tree (process group, Windows job object; `src/platform`). A baseline
   timeout is reported as `baseline_failed` (`exit_code: null`, log tail says "timed out").
 
 ## Test projects

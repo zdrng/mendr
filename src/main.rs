@@ -1,13 +1,17 @@
 //! mendr: find known vulnerabilities in project dependencies and fix them the
 //! way a developer would. See PLAN.md for the design.
+// System calls only in src/platform, which allows them per file.
+#![deny(unsafe_code)]
 
 mod cache;
 mod config;
 mod ecosystem;
 mod http;
+mod interrupt;
 mod model;
 mod osv;
 mod plan;
+mod platform;
 mod progress;
 mod report;
 mod rules;
@@ -82,8 +86,8 @@ enum Format {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    verify::install_signal_handlers();
-    match verify::catch_interrupt(|| run(&cli)) {
+    platform::install_interrupt_handlers();
+    match interrupt::catch(|| run(&cli)) {
         Ok(Ok(code)) => ExitCode::from(code),
         Ok(Err(e)) => {
             progress::error(format!("{e:#}"));
@@ -138,7 +142,7 @@ fn run(cli: &Cli) -> Result<u8> {
         let mut pr = ProjectReport::new(&project.path, &config.base_dir);
         let result = run_project(cli, &config, project, &mut osv, now, &mut seen_ids, &mut pr);
         // A signal during write-back takes effect here.
-        verify::check_interrupted();
+        interrupt::check();
         if let Err(e) = result {
             progress::error(format!("project {}: {e:#}", pr.path));
             pr.error = Some(format!("{e:#}"));

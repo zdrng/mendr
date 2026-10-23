@@ -5,10 +5,11 @@
 //!    skipped; symlinks are recreated only when they resolve inside the
 //!    project (absolute ones are re-pointed into the copy), all others are
 //!    skipped, so nothing outside the tree is reachable through the copy.
-//! 2. Baseline: run `commands.install`, `build`, `test` (`sh -c`, cwd = copy,
-//!    `project.timeout` per command, each in its own process group that is
-//!    killed when the command ends, so background processes do not survive
-//!    it; see [`install_signal_handlers`] for Ctrl-C). If anything fails,
+//! 2. Baseline: run `commands.install`, `build`, `test` (the platform's
+//!    shell, `sh -c` or `cmd /C`; cwd = copy, `project.timeout` per command;
+//!    each as a [`platform::ProcessTree`] that is killed when the command
+//!    ends, so background processes do not survive it; see
+//!    [`crate::interrupt`] for Ctrl-C). If anything fails,
 //!    every finding that has a change becomes `Failed { BaselineFailed }`
 //!    and nothing else runs.
 //!    Then resolve the graph and scan it (the "current" state).
@@ -52,8 +53,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -61,9 +62,11 @@ use jiff::Timestamp;
 
 use crate::config::{IgnoreRule, Policy, ProjectConfig};
 use crate::ecosystem::{AdapterError, ApplyOptions, Commands, Ecosystem, Shell};
+use crate::interrupt;
 use crate::model::{Change, DepGraph, FailReason, NodeId, Outcome, Step, log_tail};
 use crate::osv::{self, Advisory, Osv};
 use crate::plan::{Finding, ProjectPlan};
+use crate::platform::{self, ProcessTree};
 use crate::progress;
 use crate::rules::{self, IgnoreMatch};
 
@@ -98,7 +101,7 @@ pub struct Verified {
 /// (e.g. the copy failed); per-change problems are recorded as outcomes.
 pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Result<Verified> {
     // A signal now unwinds at the next check, which removes the temp dir.
-    let _defer = defer_signals();
+    let _defer = interrupt::defer();
     let excludes = ctx.eco.copy_excludes();
     let root = ctx
         .project
@@ -133,7 +136,7 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
     // A reverted attempt ran commands after the last kept change.
     let mut dirty = false;
     for change in &plan.changes {
-        check_interrupted();
+        interrupt::check();
         let step = progress::begin("Trying", change);
         let findings: Vec<&Finding> = plan
             .findings
@@ -206,7 +209,7 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
         }
     }
 
-    check_interrupted();
+    interrupt::check();
     set_outcomes(plan, &kept, &failed, None);
     let originals = files
         .keys()
@@ -224,11 +227,9 @@ pub fn verify(ctx: &VerifyContext, osv: &mut Osv, plan: &mut ProjectPlan) -> Res
 /// to their targets, then renamed over them, then deletions are done: a
 /// failure while preparing leaves the project untouched.
 pub fn write_back(ctx: &VerifyContext, verified: &Verified) -> Result<Vec<PathBuf>> {
-    use std::os::unix::fs::PermissionsExt;
-
     // Not interrupted half-way: a signal takes effect afterwards.
-    let _defer = defer_signals();
-    check_interrupted();
+    let _defer = interrupt::defer();
+    interrupt::check();
     let root = &ctx.project.path;
 
     let mut changed = Vec::new();
@@ -264,9 +265,10 @@ pub fn write_back(ctx: &VerifyContext, verified: &Verified) -> Result<Vec<PathBu
                 .prefix(".mendr-")
                 .tempfile_in(parent)?;
             io::Write::write_all(&mut tmp, bytes)?;
-            let mode = fs::metadata(&path).map_or(0o644, |m| m.permissions().mode() & 0o7777);
-            tmp.as_file()
-                .set_permissions(fs::Permissions::from_mode(mode))?;
+            let existing = fs::metadata(&path).ok();
+            if let Some(perms) = platform::replacement_permissions(existing.as_ref()) {
+                tmp.as_file().set_permissions(perms)?;
+            }
             Ok(tmp)
         };
         let tmp = stage().with_context(|| format!("preparing {}", path.display()))?;
@@ -672,25 +674,24 @@ impl Shell for CopyShell<'_> {
     }
 }
 
-/// `sh -c command` in `dir` with stdin closed and stdout+stderr captured
-/// together, in its own process group. When the command exits, times out
-/// or mendr is interrupted, the whole group is killed, so nothing it
-/// started in the background keeps running in the copy. A zero timeout
-/// counts as none. On an interrupt this unwinds (see [`check_interrupted`]).
+/// `command` in the platform's shell in `dir`, with stdin closed and
+/// stdout+stderr captured together, as a [`ProcessTree`]. When the command
+/// exits, times out or mendr is interrupted, the whole tree is killed, so
+/// nothing it started in the background keeps running in the copy. A zero
+/// timeout counts as none. On an interrupt this unwinds (see
+/// [`interrupt::check`]).
 fn run_shell(
     dir: &Path,
     command: &str,
     env: &[(String, String)],
     timeout: Option<Duration>,
 ) -> Run {
-    use std::os::unix::process::CommandExt;
-
-    check_interrupted();
+    interrupt::check();
     let timeout = timeout.filter(|t| !t.is_zero());
     progress::detail(&format!("$ {command}"));
     let failed = |e: io::Error| Run::Failed {
         exit_code: None,
-        log_tail: format!("could not run `sh -c {command}`: {e}"),
+        log_tail: format!("could not run `{} {command}`: {e}", platform::SHELL),
     };
     // A file (not a pipe): the command can write any amount while we poll.
     let mut log = match tempfile::tempfile() {
@@ -701,27 +702,19 @@ fn run_shell(
         (Ok(o), Ok(e)) => (o, e),
         (Err(e), _) | (_, Err(e)) => return failed(e),
     };
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command);
+    let mut cmd = platform::shell(command);
     crate::ecosystem::set_env(&mut cmd, env);
-    let child = cmd
-        .current_dir(dir)
+    cmd.current_dir(dir)
         .stdin(Stdio::null())
         .stdout(out)
-        .stderr(err)
-        // Own process group, so we can kill everything it started.
-        .process_group(0)
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
+        .stderr(err);
+    let mut tree = match ProcessTree::spawn(&mut cmd) {
+        Ok(t) => t,
         Err(e) => return failed(e),
     };
-    let group = child.id() as libc::pid_t;
-    CHILD_GROUP.store(group, Ordering::SeqCst);
-    let status = wait_for(&mut child, timeout, &SIGNAL);
-    kill_group(group);
-    CHILD_GROUP.store(0, Ordering::SeqCst);
-    check_interrupted();
+    let status = wait_for(&mut tree, timeout, &interrupt::SIGNAL);
+    drop(tree);
+    interrupt::check();
     let tail = read_tail(&mut log);
     match status {
         Ok(Some(s)) if s.success() => Run::Ok,
@@ -738,21 +731,21 @@ fn run_shell(
 }
 
 /// How long a command may take to exit after mendr was interrupted (the
-/// signal handler forwards the signal to its group) before it is killed.
+/// command got the interrupt too) before it is killed.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(1);
 
-/// Poll until the child exits (`Some(status)`), or `limit` passes or
-/// `signal` is set (plus [`INTERRUPT_GRACE`]): then kill its process group
-/// and return `None`.
+/// Poll until the command exits (`Some(status)`), or `limit` passes or
+/// `signal` is set (plus [`INTERRUPT_GRACE`]): then kill its tree and
+/// return `None`.
 fn wait_for(
-    child: &mut Child,
+    tree: &mut ProcessTree,
     limit: Option<Duration>,
     signal: &AtomicI32,
 ) -> io::Result<Option<ExitStatus>> {
     let start = Instant::now();
     let mut interrupted_at = None;
     loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = tree.try_wait()? {
             return Ok(Some(status));
         }
         if signal.load(Ordering::SeqCst) != 0 {
@@ -760,23 +753,10 @@ fn wait_for(
         }
         let interrupted = interrupted_at.is_some_and(|t: Instant| t.elapsed() >= INTERRUPT_GRACE);
         if interrupted || limit.is_some_and(|l| start.elapsed() >= l) {
-            kill_group(child.id() as libc::pid_t);
-            let _ = child.kill();
-            child.wait()?;
+            tree.kill()?;
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// SIGKILL every process left in process group `group`.
-fn kill_group(group: libc::pid_t) {
-    // SAFETY: plain syscall. The group id is the pid of a child we spawned
-    // as a group leader; it cannot be reused while any member is alive, and
-    // reuse right after the last one exited would need a pid wraparound
-    // within microseconds.
-    unsafe {
-        libc::killpg(group, libc::SIGKILL);
     }
 }
 
@@ -799,114 +779,6 @@ fn read_tail(log: &mut fs::File) -> String {
         text.drain(..cut);
     }
     log_tail(&text)
-}
-
-// ---- Interrupts ------------------------------------------------------------------------
-
-/// The signal that interrupted mendr (0 = none yet).
-static SIGNAL: AtomicI32 = AtomicI32::new(0);
-/// Process group of the command running right now (0 = none).
-static CHILD_GROUP: AtomicI32 = AtomicI32::new(0);
-/// Number of active [`DeferSignals`] guards.
-static DEFERRING: AtomicUsize = AtomicUsize::new(0);
-
-/// Unwind payload of an interrupted run; see [`catch_interrupt`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Interrupted(pub i32);
-
-impl Interrupted {
-    /// Conventional exit code: 128 + signal number (130 for SIGINT, 143 for
-    /// SIGTERM, 129 for SIGHUP).
-    pub fn exit_code(self) -> u8 {
-        u8::try_from(128 + self.0).unwrap_or(255)
-    }
-}
-
-/// Install handlers for SIGINT, SIGTERM and SIGHUP (signals that are
-/// ignored at startup stay ignored). Commands run in their own process
-/// group, so a terminal's Ctrl-C does not reach them; the handler forwards
-/// the signal to the running command's group. Outside of [`verify`] and
-/// [`write_back`] (nothing to clean up) mendr then exits at once; inside,
-/// it unwinds at the next check, so the temp copy is removed and nothing
-/// is half-written, and [`catch_interrupt`] turns that into an exit code.
-/// A second signal exits at once.
-pub fn install_signal_handlers() {
-    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        // SAFETY: `on_signal` only does async-signal-safe things (atomics,
-        // killpg, _exit); the sigaction structs are fully initialised.
-        unsafe {
-            let mut old: libc::sigaction = std::mem::zeroed();
-            if libc::sigaction(sig, std::ptr::null(), &mut old) == 0
-                && old.sa_sigaction == libc::SIG_IGN
-            {
-                continue;
-            }
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
-            action.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut action.sa_mask);
-            libc::sigaction(sig, &action, std::ptr::null_mut());
-        }
-    }
-}
-
-extern "C" fn on_signal(sig: libc::c_int) {
-    let group = CHILD_GROUP.load(Ordering::SeqCst);
-    let first = SIGNAL
-        .compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok();
-    // SAFETY: killpg and _exit are async-signal-safe.
-    unsafe {
-        if group > 0 {
-            libc::killpg(group, sig);
-        }
-        if !first || DEFERRING.load(Ordering::SeqCst) == 0 {
-            if group > 0 {
-                libc::killpg(group, libc::SIGKILL);
-            }
-            libc::_exit(128 + sig);
-        }
-    }
-}
-
-/// While a guard is alive, a signal does not exit at once but makes
-/// [`check_interrupted`] unwind.
-struct DeferSignals;
-
-fn defer_signals() -> DeferSignals {
-    DEFERRING.fetch_add(1, Ordering::SeqCst);
-    DeferSignals
-}
-
-impl Drop for DeferSignals {
-    fn drop(&mut self) {
-        DEFERRING.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-/// Unwind with [`Interrupted`] if a signal arrived. Called between steps,
-/// so the temp copy (a `TempDir`) is removed on the way out.
-pub fn check_interrupted() {
-    let sig = SIGNAL.load(Ordering::SeqCst);
-    if sig != 0 {
-        unwind_interrupted(sig);
-    }
-}
-
-fn unwind_interrupted(sig: i32) -> ! {
-    // `resume_unwind` does not run the panic hook: no panic message.
-    std::panic::resume_unwind(Box::new(Interrupted(sig)))
-}
-
-/// Run `f`, turning an unwind from [`check_interrupted`] into
-/// `Err(Interrupted)`. Real panics keep unwinding.
-pub fn catch_interrupt<T>(f: impl FnOnce() -> T) -> Result<T, Interrupted> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
-        match payload.downcast::<Interrupted>() {
-            Ok(i) => *i,
-            Err(other) => std::panic::resume_unwind(other),
-        }
-    })
 }
 
 // ---- Files -----------------------------------------------------------------------------
@@ -969,9 +841,25 @@ fn copy_dir(
                     let link = if target.is_absolute() {
                         dst_root.join(resolved.strip_prefix(root).expect("checked above"))
                     } else {
-                        target
+                        target.clone()
                     };
-                    std::os::unix::fs::symlink(link, &d)?;
+                    // Without the right to create symlinks (Windows by
+                    // default), copy what the link points to instead, unless
+                    // that contains the link itself.
+                    if platform::symlink(&link, &d, resolved.is_dir()).is_err() {
+                        if !resolved.is_dir() {
+                            fs::copy(&resolved, &d)?;
+                        } else if !s.starts_with(&resolved) {
+                            copy_dir(root, &resolved, dst_root, &d, excludes)?;
+                        } else {
+                            progress::warn(format!(
+                                "not copying symlink {} -> {} (no right to create symlinks, \
+                                 and it points to a directory containing it)",
+                                s.display(),
+                                target.display()
+                            ));
+                        }
+                    }
                 }
                 _ => progress::warn(format!(
                     "not copying symlink {} -> {} (it does not resolve inside the project)",
@@ -1139,8 +1027,8 @@ mod tests {
             ignores: Vec::new(),
             commands: Commands {
                 install: None,
-                build: Some("true".into()),
-                test: Some("true".into()),
+                build: Some("exit 0".into()),
+                test: Some("exit 0".into()),
             },
             timeout: None,
         }
@@ -1241,6 +1129,11 @@ mod tests {
         locked(r.verified.files[Path::new(LOCKFILE)].as_ref().unwrap())
     }
 
+    /// The test command for the platform's shell: `sh` or `cmd`.
+    fn shell(unix: &str, windows: &str) -> String {
+        if cfg!(windows) { windows } else { unix }.to_string()
+    }
+
     #[test]
     fn all_good_is_fixed_and_original_untouched() {
         let mut s = setup();
@@ -1273,7 +1166,10 @@ mod tests {
     #[test]
     fn write_back_copies_only_changed_files() {
         let mut s = setup();
-        s.commands.build = Some("echo built > out.txt && mkdir -p dist && echo x > dist/a".into());
+        s.commands.build = Some(shell(
+            "echo built > out.txt && mkdir -p dist && echo x > dist/a",
+            r"echo built > out.txt && mkdir dist && echo x > dist\a",
+        ));
         let r = run(&s);
         let written = r.write_back(&s);
         assert_eq!(written, vec![r.project.path().join(LOCKFILE)]);
@@ -1325,7 +1221,7 @@ mod tests {
         let mut out: Vec<String> = list_files(dir, &[])
             .unwrap()
             .iter()
-            .map(|p| p.display().to_string())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
             .collect();
         out.sort();
         out
@@ -1333,13 +1229,15 @@ mod tests {
 
     #[test]
     fn write_back_writes_creates_and_deletes() {
-        use std::os::unix::fs::PermissionsExt;
-
         let s = setup();
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         fs::write(d.join("a.lock"), "old").unwrap();
-        fs::set_permissions(d.join("a.lock"), fs::Permissions::from_mode(0o600)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(d.join("a.lock"), fs::Permissions::from_mode(0o600)).unwrap();
+        }
         fs::write(d.join("b.json"), "b").unwrap();
         let v = verified(&[
             ("a.lock", Some("old"), Some("new")),
@@ -1355,9 +1253,13 @@ mod tests {
         assert_eq!(tree(d), ["a.lock", "sub/c.json"]);
         assert_eq!(fs::read_to_string(d.join("a.lock")).unwrap(), "new");
         assert_eq!(fs::read_to_string(d.join("sub/c.json")).unwrap(), "c");
-        let mode = |p: &str| fs::metadata(d.join(p)).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode("a.lock"), 0o600, "permissions kept");
-        assert_eq!(mode("sub/c.json"), 0o644);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &str| fs::metadata(d.join(p)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode("a.lock"), 0o600, "permissions kept");
+            assert_eq!(mode("sub/c.json"), 0o644);
+        }
 
         // Deleted meanwhile: refused too.
         let v = verified(&[
@@ -1368,6 +1270,8 @@ mod tests {
         assert_eq!(fs::read_to_string(d.join("a.lock")).unwrap(), "new");
     }
 
+    /// Read-only directories: Unix permissions.
+    #[cfg(unix)]
     #[test]
     fn write_back_failure_while_preparing_writes_nothing() {
         use std::os::unix::fs::PermissionsExt;
@@ -1398,7 +1302,7 @@ mod tests {
     #[test]
     fn baseline_failure_fails_every_planned_finding() {
         let mut s = setup();
-        s.commands.build = Some("echo broken; exit 3".into());
+        s.commands.build = Some("echo broken&& exit 3".into());
         let r = run(&s);
         assert_eq!(
             r.labels(),
@@ -1411,7 +1315,7 @@ mod tests {
             r.reason("p"),
             &FailReason::BaselineFailed {
                 step: Step::Build,
-                command: "echo broken; exit 3".into(),
+                command: "echo broken&& exit 3".into(),
                 exit_code: Some(3),
                 log_tail: "broken".into(),
             }
@@ -1507,7 +1411,10 @@ mod tests {
     fn baseline_timeout_is_a_baseline_failure() {
         let mut s = setup();
         s.timeout = Some(Duration::from_secs(1));
-        s.commands.install = Some("echo installing; sleep 30".into());
+        s.commands.install = Some(shell(
+            "echo installing; sleep 30",
+            "echo installing&& ping -n 30 127.0.0.1 > nul",
+        ));
         let r = run(&s);
         match r.reason("p") {
             FailReason::BaselineFailed {
@@ -1701,30 +1608,25 @@ mod tests {
         assert_eq!(kept_lock(&r), vec!["a@1.0.0", "p@1.0.1", "b@1.0.0"]);
     }
 
-    /// Whether process `pid` still exists, waiting up to 5s for it to go.
-    fn still_alive(pid: libc::pid_t) -> bool {
-        let start = Instant::now();
-        // SAFETY: signal 0 only checks for existence.
-        while unsafe { libc::kill(pid, 0) } == 0 {
-            if start.elapsed() > Duration::from_secs(5) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        false
-    }
-
-    fn read_pid(path: &Path) -> libc::pid_t {
+    #[cfg(unix)]
+    fn read_pid(path: &Path) -> u32 {
         fs::read_to_string(path).unwrap().trim().parse().unwrap()
     }
 
+    // The process tests below use sh; platform/windows.rs tests the same for
+    // job objects.
+
+    #[cfg(unix)]
     #[test]
     fn background_processes_do_not_outlive_the_command() {
         let dir = tempfile::tempdir().unwrap();
         let run = run_shell(dir.path(), "sleep 30 & echo $! > bg.pid; exit 0", &[], None);
         assert!(matches!(run, Run::Ok));
         let pid = read_pid(&dir.path().join("bg.pid"));
-        assert!(!still_alive(pid), "background process {pid} survived");
+        assert!(
+            !platform::still_alive(pid),
+            "background process {pid} survived"
+        );
     }
 
     #[test]
@@ -1734,39 +1636,35 @@ mod tests {
             "npm_config_registry".to_string(),
             "https://registry.npmjs.org/".to_string(),
         )];
-        let run = run_shell(
-            dir.path(),
+        let command = shell(
             "echo \"$npm_config_registry\" > out",
-            &env,
-            None,
+            "echo %npm_config_registry%> out",
         );
+        let run = run_shell(dir.path(), &command, &env, None);
         assert!(matches!(run, Run::Ok));
         assert_eq!(
-            fs::read_to_string(dir.path().join("out")).unwrap(),
-            "https://registry.npmjs.org/\n"
+            fs::read_to_string(dir.path().join("out"))
+                .unwrap()
+                .trim_end(),
+            "https://registry.npmjs.org/"
         );
     }
 
     #[test]
     fn zero_timeout_is_no_timeout() {
         let dir = tempfile::tempdir().unwrap();
-        let run = run_shell(dir.path(), "sleep 0.1", &[], Some(Duration::ZERO));
+        let run = run_shell(dir.path(), "exit 0", &[], Some(Duration::ZERO));
         assert!(matches!(run, Run::Ok));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn interrupt_kills_the_command_group() {
-        use std::os::unix::process::CommandExt;
-
+    fn interrupt_kills_the_command_tree() {
         let dir = tempfile::tempdir().unwrap();
         // The background process ignores the forwarded SIGTERM.
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("(trap '' TERM; sleep 30) & echo $! > bg.pid; wait")
-            .current_dir(dir.path())
-            .process_group(0)
-            .spawn()
-            .unwrap();
+        let mut cmd = platform::shell("(trap '' TERM; sleep 30) & echo $! > bg.pid; wait");
+        cmd.current_dir(dir.path());
+        let mut tree = ProcessTree::spawn(&mut cmd).unwrap();
         let pid_file = dir.path().join("bg.pid");
         let signal = AtomicI32::new(0);
         let start = Instant::now();
@@ -1775,38 +1673,23 @@ mod tests {
                 while fs::read_to_string(&pid_file).map_or(true, |t| !t.ends_with('\n')) {
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                signal.store(libc::SIGTERM, Ordering::SeqCst);
+                signal.store(interrupt::SIGTERM, Ordering::SeqCst);
             });
-            let status = wait_for(&mut child, None, &signal).unwrap();
+            let status = wait_for(&mut tree, None, &signal).unwrap();
             assert_eq!(status, None);
         });
         assert!(start.elapsed() < Duration::from_secs(10));
-        assert!(!still_alive(read_pid(&pid_file)));
-    }
-
-    #[test]
-    fn interrupt_unwinds_and_removes_temp_dirs() {
-        let parent = tempfile::tempdir().unwrap();
-        let mut path = PathBuf::new();
-        let result = catch_interrupt(|| {
-            let tmp = tempfile::tempdir_in(parent.path()).unwrap();
-            path = tmp.path().to_path_buf();
-            unwind_interrupted(libc::SIGTERM);
-        });
-        assert_eq!(result, Err(Interrupted(libc::SIGTERM)));
-        assert_eq!(Interrupted(libc::SIGTERM).exit_code(), 143);
-        assert_eq!(Interrupted(libc::SIGINT).exit_code(), 130);
-        assert!(!path.as_os_str().is_empty() && !path.exists());
-        assert_eq!(catch_interrupt(|| 7), Ok(7));
+        assert!(!platform::still_alive(read_pid(&pid_file)));
     }
 
     /// End to end: mendr's signal handler, the forwarded signal, the kill
     /// of the command's group and the unwind that removes the temp dir. Runs
     /// [`signal_helper`] in a child process (signals are process-wide).
+    #[cfg(unix)]
     #[test]
     fn sigterm_cleans_up_and_exits_143() {
         let dir = tempfile::tempdir().unwrap();
-        let mut child = Command::new(std::env::current_exe().unwrap())
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "verify::tests::signal_helper", "--ignored"])
             .arg("--test-threads=1")
             .env("MENDR_SIGNAL_TEST_DIR", dir.path())
@@ -1823,8 +1706,11 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        // SAFETY: plain syscall on our own child.
-        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        let kill = std::process::Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(kill.success());
         let status = loop {
             if let Some(s) = child.try_wait().unwrap() {
                 break s;
@@ -1836,7 +1722,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
         assert_eq!(status.code(), Some(143));
-        assert!(!still_alive(read_pid(&pid_file)));
+        assert!(!platform::still_alive(read_pid(&pid_file)));
         let left: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1845,6 +1731,7 @@ mod tests {
         assert!(left.is_empty(), "temp dir left behind");
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "helper process of sigterm_cleans_up_and_exits_143"]
     fn signal_helper() {
@@ -1852,9 +1739,9 @@ mod tests {
             return;
         };
         let dir = PathBuf::from(dir);
-        install_signal_handlers();
-        let result = catch_interrupt(|| {
-            let _defer = defer_signals();
+        platform::install_interrupt_handlers();
+        let result = interrupt::catch(|| {
+            let _defer = interrupt::defer();
             let work = tempfile::Builder::new()
                 .prefix("work")
                 .tempdir_in(&dir)
@@ -1886,6 +1773,8 @@ mod tests {
         assert_eq!(read_tail(&mut log), "short\noutput");
     }
 
+    /// Symlinks need privileges on Windows.
+    #[cfg(unix)]
     #[test]
     fn copy_skips_excludes_and_outside_symlinks() {
         let outside = tempfile::tempdir().unwrap();

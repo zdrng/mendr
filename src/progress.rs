@@ -55,6 +55,7 @@ pub fn init(quiet: bool) {
         Style::Plain
     };
     if STYLE.set(style).is_ok() && matches!(style, Style::Terminal { .. }) {
+        crate::platform::enable_ansi();
         std::thread::spawn(|| {
             let mut frame = 0usize;
             loop {
@@ -214,7 +215,9 @@ fn draw(a: &mut Active, frame: usize) {
         FRAMES[frame % FRAMES.len()],
         a.started.elapsed().as_secs()
     );
-    let width = terminal_width().saturating_sub(1);
+    let width = crate::platform::terminal_width()
+        .unwrap_or(80)
+        .saturating_sub(1);
     let mut text = truncate(&head, width);
     let room = width.saturating_sub(text.chars().count() + 2);
     if !a.detail.is_empty() && room > 8 {
@@ -236,17 +239,6 @@ fn truncate(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
-}
-
-fn terminal_width() -> usize {
-    // SAFETY: TIOCGWINSZ only writes into the `winsize` we pass.
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let ok = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
-    if ok && ws.ws_col > 0 {
-        ws.ws_col as usize
-    } else {
-        80
-    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,29 @@ jobs:
       - name: cargo audit
         run: nix develop -c cargo audit
 
+  # src/platform/windows.rs: lints and unit tests on Windows. Nix does not
+  # run there; rustup installs the toolchain flake.nix pins.
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          version=$(sed -n 's/^ *releaseRust = "\(.*\)";$/\1/p' flake.nix)
+          rustup toolchain install "$version" --profile minimal --component clippy
+          rustup default "$version"
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+
   # Unsafe code in mendr and its dependencies, as a report in the job summary.
   geiger:
     runs-on: ubuntu-latest

@@ -318,7 +318,7 @@ fn bump_declarations(
 /// `npm install --package-lock-only` without scripts, honouring the release
 /// cutoff, with `env` ([`Ecosystem::command_env`]).
 fn install_command(workdir: &Path, opts: &ApplyOptions, env: &[(String, String)]) -> Command {
-    let mut cmd = Command::new("npm");
+    let mut cmd = crate::platform::command("npm");
     super::set_env(&mut cmd, env);
     cmd.current_dir(workdir).args([
         "install",
@@ -451,6 +451,8 @@ mod tests {
         assert_eq!(c.test.as_deref(), Some("npm test"));
     }
 
+    /// The fake npm is a shell script.
+    #[cfg(unix)]
     #[test]
     fn npm_gets_the_configured_registry() {
         use std::os::unix::fs::PermissionsExt;
@@ -613,8 +615,7 @@ mod tests {
             }
             let install_and_test = || {
                 super::super::run(
-                    Command::new("sh")
-                        .args(["-c", "npm ci --no-audit --no-fund && npm test"])
+                    crate::platform::shell("npm ci --no-audit --no-fund && npm test")
                         .current_dir(dir.path()),
                 )
                 .unwrap_or_else(|e| panic!("{name}: {e}"));

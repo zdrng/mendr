@@ -313,8 +313,8 @@ impl Ecosystem for Fake {
     fn default_commands(&self, _project_dir: &Path) -> Commands {
         Commands {
             install: None,
-            build: Some("true".into()),
-            test: Some("true".into()),
+            build: Some("exit 0".into()),
+            test: Some("exit 0".into()),
         }
     }
 

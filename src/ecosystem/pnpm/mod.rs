@@ -569,7 +569,7 @@ fn pnpm_install(workdir: &Path, opts: &ApplyOptions) -> Result<(), AdapterError>
         let secs = jiff::Timestamp::now().duration_since(cutoff).as_secs();
         (secs.max(0) + 59) / 60
     });
-    let mut cmd = Command::new("pnpm");
+    let mut cmd = crate::platform::command("pnpm");
     cmd.current_dir(workdir)
         .args([
             "install",
@@ -1059,8 +1059,7 @@ snapshots:
             }
             let install_and_test = || {
                 super::super::run(
-                    Command::new("sh")
-                        .args(["-c", "pnpm install --frozen-lockfile && pnpm test"])
+                    crate::platform::shell("pnpm install --frozen-lockfile && pnpm test")
                         .current_dir(dir.path()),
                 )
                 .unwrap_or_else(|e| panic!("{name}: {e}"));

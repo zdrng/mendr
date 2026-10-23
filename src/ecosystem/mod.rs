@@ -346,9 +346,9 @@ mod tests {
 
     #[test]
     fn run_reports_failures() {
-        let out = run(Command::new("sh").args(["-c", "echo hi"])).unwrap();
+        let out = run(&mut crate::platform::shell("echo hi")).unwrap();
         assert_eq!(out.trim(), "hi");
-        let err = run(Command::new("sh").args(["-c", "echo oops >&2; exit 3"])).unwrap_err();
+        let err = run(&mut crate::platform::shell("echo oops>&2&& exit 3")).unwrap_err();
         match err {
             AdapterError::Command {
                 exit_code,
