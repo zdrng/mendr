@@ -1036,7 +1036,24 @@ mod tests {
 
     /// A command that fails when the copy's lockfile mentions `version`.
     fn unless_locked(version: &str) -> Option<String> {
-        Some(format!(r#"! grep -q '"{version}"' {LOCKFILE}"#))
+        Some(shell(
+            &format!(r#"! grep -q '"{version}"' {LOCKFILE}"#),
+            &format!(r#"{} && exit 1 || exit 0"#, locks(version)),
+        ))
+    }
+
+    /// cmd: succeeds when the copy's lockfile mentions `version`.
+    fn locks(version: &str) -> String {
+        format!(r#"findstr /L /C:"\"{version}\"" {LOCKFILE} >nul"#)
+    }
+
+    /// A command that appends a line to `file`.
+    fn append_line(file: &Path) -> String {
+        let file = file.display();
+        shell(
+            &format!("echo . >> '{file}'"),
+            &format!(r#"echo .>> "{file}""#),
+        )
     }
 
     struct Ran {
@@ -1168,7 +1185,7 @@ mod tests {
         let mut s = setup();
         s.commands.build = Some(shell(
             "echo built > out.txt && mkdir -p dist && echo x > dist/a",
-            r"echo built > out.txt && mkdir dist && echo x > dist\a",
+            r"echo built > out.txt && (if not exist dist mkdir dist) && echo x > dist\a",
         ));
         let r = run(&s);
         let written = r.write_back(&s);
@@ -1349,7 +1366,7 @@ mod tests {
         let mut s = setup();
         let counter = tempfile::tempdir().unwrap();
         let count = counter.path().join("builds");
-        s.commands.build = Some(format!("echo . >> '{}'", count.display()));
+        s.commands.build = Some(append_line(&count));
         s.commands.test = unless_locked("1.0.2"); // breaks with q@1.0.2
         let r = run(&s);
         assert_eq!(
@@ -1367,9 +1384,15 @@ mod tests {
         let marker = tempfile::tempdir().unwrap();
         let seen_q = marker.path().join("seen-q");
         // The q attempt leaves something behind that breaks every later run.
-        s.commands.test = Some(format!(
-            r#"test ! -e '{m}' || exit 1; if grep -q '"1.0.2"' {LOCKFILE}; then touch '{m}'; exit 1; fi"#,
-            m = seen_q.display()
+        let m = seen_q.display();
+        s.commands.test = Some(shell(
+            &format!(
+                r#"test ! -e '{m}' || exit 1; if grep -q '"1.0.2"' {LOCKFILE}; then touch '{m}'; exit 1; fi"#
+            ),
+            &format!(
+                r#"(if exist "{m}" exit 1) & {} && (type nul > "{m}" & exit 1) || exit 0"#,
+                locks("1.0.2")
+            ),
         ));
         let r = run(&s);
         assert_eq!(
@@ -1383,8 +1406,12 @@ mod tests {
     fn timeout_kills_the_command() {
         let mut s = setup();
         s.timeout = Some(Duration::from_secs(1));
-        s.commands.test = Some(format!(
-            r#"if grep -q '"1.0.1"' {LOCKFILE}; then sleep 30; fi"#
+        s.commands.test = Some(shell(
+            &format!(r#"if grep -q '"1.0.1"' {LOCKFILE}; then sleep 30; fi"#),
+            &format!(
+                r#"{} && ping -n 31 127.0.0.1 >nul || exit 0"#,
+                locks("1.0.1")
+            ),
         ));
         let start = Instant::now();
         let r = run(&s);
@@ -1887,7 +1914,7 @@ mod tests {
         let mut s = setup();
         let counter = tempfile::tempdir().unwrap();
         let count = counter.path().join("builds");
-        s.commands.build = Some(format!("echo . >> '{}'", count.display()));
+        s.commands.build = Some(append_line(&count));
         s.fake.no_effect.push("q".into()); // q fails before any command
         let r = run(&s);
         assert_eq!(

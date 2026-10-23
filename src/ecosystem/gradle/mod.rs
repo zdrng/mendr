@@ -376,10 +376,16 @@ mod tests {
             Some("gradle assemble --no-daemon --console=plain")
         );
         write(dir.path(), "gradlew", "#!/bin/sh\n");
+        write(dir.path(), "gradlew.bat", "@echo off\n");
         let c = gradle.default_commands(dir.path());
+        let wrapper = if cfg!(windows) {
+            "gradlew.bat"
+        } else {
+            "./gradlew"
+        };
         assert_eq!(
-            c.test.as_deref(),
-            Some("./gradlew test --no-daemon --console=plain")
+            c.test,
+            Some(format!("{wrapper} test --no-daemon --console=plain"))
         );
     }
 
