@@ -59,7 +59,7 @@ Then, unless `--plan-only`, mendr copies the project to a temp dir and:
 ## Install and run
 
 Prebuilt binaries are on the [releases page](https://github.com/zdrng/mendr/releases): static
-Linux binaries (x86_64, aarch64), a macOS universal binary. Every
+Linux binaries (x86_64, aarch64), a macOS universal binary and a Windows executable. Every
 asset is attested by the release workflow (SLSA build provenance, Sigstore), so you can check it
 was built by this repository's workflow from `main`, and it is reproducible
 (`scripts/release.sh`):
@@ -72,8 +72,12 @@ tar -xzf mendr-$v-$target.tar.gz
 install -m 0755 mendr-$v-$target/mendr ~/.local/bin/mendr
 ```
 
+On Windows, download `mendr-<version>-x86_64-pc-windows-msvc.exe` from the release and check it
+the same way (`gh attestation verify mendr-<version>-x86_64-pc-windows-msvc.exe --repo zdrng/mendr`).
+
 The binaries carry no operating system code signature. Downloaded with `curl` they just run; a
-browser download is quarantined by macOS (`xattr -d com.apple.quarantine mendr`).
+browser download is quarantined by macOS (`xattr -d com.apple.quarantine mendr`) and makes
+Windows SmartScreen ask once (More info → Run anyway).
 
 From source, the toolchains come from the Nix flake (Rust, Node 22, pnpm, Gradle, JDK 21):
 

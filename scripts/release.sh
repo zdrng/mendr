@@ -39,7 +39,7 @@
 # and gzip without name or time.
 set -euo pipefail
 
-targets="x86_64-unknown-linux-musl aarch64-unknown-linux-musl universal-apple-darwin"
+targets="x86_64-unknown-linux-musl aarch64-unknown-linux-musl universal-apple-darwin x86_64-pc-windows-msvc"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 manifest_value() {
