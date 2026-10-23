@@ -346,9 +346,9 @@ mod tests {
 
     #[test]
     fn run_reports_failures() {
-        let out = run(Command::new("sh").args(["-c", "echo hi"])).unwrap();
+        let out = run(&mut crate::platform::shell("echo hi")).unwrap();
         assert_eq!(out.trim(), "hi");
-        let err = run(Command::new("sh").args(["-c", "echo oops >&2; exit 3"])).unwrap_err();
+        let err = run(&mut crate::platform::shell("echo oops>&2&& exit 3")).unwrap_err();
         match err {
             AdapterError::Command {
                 exit_code,
@@ -371,12 +371,18 @@ mod tests {
             &mut cmd,
             &[("npm_config_registry".into(), "https://file.example/".into())],
         );
+        // Unix: the other spelling is removed. Windows: one variable for all
+        // spellings, which keeps the name it was first given.
         let envs: Vec<_> = cmd.get_envs().collect();
-        assert!(envs.contains(&("NPM_CONFIG_REGISTRY".as_ref(), None)));
-        assert!(envs.contains(&(
-            "npm_config_registry".as_ref(),
-            Some("https://file.example/".as_ref())
-        )));
+        assert!(envs.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("npm_config_registry")
+                && *v == Some("https://file.example/".as_ref())
+        }));
+        assert!(
+            !envs
+                .iter()
+                .any(|(_, v)| *v == Some("https://upper.example/".as_ref()))
+        );
     }
 
     #[test]

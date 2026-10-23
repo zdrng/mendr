@@ -274,12 +274,10 @@ impl Ecosystem for Gradle {
 }
 
 /// `./gradlew` if the build has a wrapper, else `gradle` from `PATH`.
-fn gradle_command(dir: &Path) -> &'static str {
-    if dir.join("gradlew").is_file() {
-        "./gradlew"
-    } else {
-        "gradle"
-    }
+/// The project's wrapper (`./gradlew`, `gradlew.bat` on Windows), else
+/// `gradle` from the PATH.
+fn gradle_command(dir: &Path) -> String {
+    crate::platform::wrapper_script(dir, "gradlew").unwrap_or_else(|| "gradle".to_string())
 }
 
 /// Rewrite every project lockfile for the edited build files.
@@ -378,10 +376,16 @@ mod tests {
             Some("gradle assemble --no-daemon --console=plain")
         );
         write(dir.path(), "gradlew", "#!/bin/sh\n");
+        write(dir.path(), "gradlew.bat", "@echo off\n");
         let c = gradle.default_commands(dir.path());
+        let wrapper = if cfg!(windows) {
+            "gradlew.bat"
+        } else {
+            "./gradlew"
+        };
         assert_eq!(
-            c.test.as_deref(),
-            Some("./gradlew test --no-daemon --console=plain")
+            c.test,
+            Some(format!("{wrapper} test --no-daemon --console=plain"))
         );
     }
 

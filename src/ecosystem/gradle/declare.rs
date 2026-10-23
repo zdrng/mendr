@@ -1577,7 +1577,8 @@ spring = { id = "org.springframework.boot", version = "3.1.0" }
             ["2.15.3"]
         );
         assert_eq!(versions(&d, "com.example:other"), ["1.0.1"]);
-        let err = not_editable(bump(dir.path(), "com.example:nover", "1.0", &cmp).unwrap_err());
+        let err = not_editable(bump(dir.path(), "com.example:nover", "1.0", &cmp).unwrap_err())
+            .replace('\\', "/");
         assert!(
             err.contains("without a version in gradle/libs.versions.toml"),
             "{err}"

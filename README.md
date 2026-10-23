@@ -59,7 +59,7 @@ Then, unless `--plan-only`, mendr copies the project to a temp dir and:
 ## Install and run
 
 Prebuilt binaries are on the [releases page](https://github.com/zdrng/mendr/releases): static
-Linux binaries (x86_64, aarch64), a macOS universal binary. Every
+Linux binaries (x86_64, aarch64), a macOS universal binary and a Windows executable. Every
 asset is attested by the release workflow (SLSA build provenance, Sigstore), so you can check it
 was built by this repository's workflow from `main`, and it is reproducible
 (`scripts/release.sh`):
@@ -72,8 +72,12 @@ tar -xzf mendr-$v-$target.tar.gz
 install -m 0755 mendr-$v-$target/mendr ~/.local/bin/mendr
 ```
 
+On Windows, download `mendr-<version>-x86_64-pc-windows-msvc.exe` from the release and check it
+the same way (`gh attestation verify mendr-<version>-x86_64-pc-windows-msvc.exe --repo zdrng/mendr`).
+
 The binaries carry no operating system code signature. Downloaded with `curl` they just run; a
-browser download is quarantined by macOS (`xattr -d com.apple.quarantine mendr`).
+browser download is quarantined by macOS (`xattr -d com.apple.quarantine mendr`) and makes
+Windows SmartScreen ask once (More info → Run anyway).
 
 From source, the toolchains come from the Nix flake (Rust, Node 22, pnpm, Gradle, JDK 21):
 
@@ -185,7 +189,7 @@ Default commands:
 | cargo | - | `cargo build --locked --all-targets` | `cargo test --locked` |
 | npm | `npm ci --no-audit --no-fund` | `npm run build` if `scripts.build` exists | `npm test` if a real `scripts.test` exists |
 | pnpm | `pnpm install --frozen-lockfile` | `pnpm run build` if `scripts.build` exists | `pnpm test` if a real `scripts.test` exists |
-| gradle | - | `./gradlew assemble --no-daemon --console=plain` (`gradle` without a wrapper) | `./gradlew test --no-daemon --console=plain` |
+| gradle | - | `./gradlew assemble --no-daemon --console=plain` (`gradlew.bat` on Windows, `gradle` without a wrapper) | `./gradlew test --no-daemon --console=plain` |
 
 ## What verification runs
 
@@ -205,10 +209,13 @@ mxc-exec-mac examples/mxc/npm.json > report.md   # after adjusting the paths in 
 Other options: a container, a VM, a CI job without secrets, or `--plan-only` (runs no project
 code).
 
-The temp copy leaves out `.git` and every `node_modules`. Commands run in their own process
-group, which is killed when the command ends (no background process survives it). On Ctrl-C,
-`SIGTERM` or `SIGHUP` mendr stops the running command, removes the temp copy and exits with
-128 + the signal number (130, 143, 129); a second signal exits at once. `--write` refuses to
+The temp copy leaves out `.git` and every `node_modules`. Commands (the defaults below and those
+in `mendr.toml`) run in the system shell: `sh -c` on Linux and macOS, `cmd /C` on Windows, so
+write them in that shell's syntax. Each runs in its own process group (Windows: job object),
+which is killed when the command ends (no background process survives it). On Ctrl-C,
+`SIGTERM` or `SIGHUP` (Windows: Ctrl-C, Ctrl-Break, closing the console) mendr stops the running
+command, removes the temp copy and exits with 128 + the signal number (130, 143, 129); a second
+signal exits at once. `--write` refuses to
 touch the project if a file it would write changed since mendr copied it, and replaces files by
 renaming temp files written next to them.
 

@@ -8,7 +8,6 @@ license = "GPL-3.0-only"
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 jiff = { version = "0.2.38", features = ["serde"] }
-libc = "0.2.190"
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
@@ -18,6 +17,21 @@ thiserror = "2.0.21"
 toml = "1.1.6"
 toml_edit = "0.25.15"
 ureq = { version = "3.4.2", features = ["json"] }
+
+# System calls of src/platform (process groups, signals, job objects, the
+# console): one crate per platform, only built for it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.190"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 # Reproducible release builds (scripts/release.sh adds --locked and path
 # remapping): one codegen unit, no symbols.

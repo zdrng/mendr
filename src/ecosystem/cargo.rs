@@ -26,7 +26,6 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -337,7 +336,7 @@ impl Metadata {
 }
 
 fn metadata(dir: &Path) -> Result<Metadata, AdapterError> {
-    let out = run(Command::new("cargo")
+    let out = run(crate::platform::command("cargo")
         .args([
             "metadata",
             "--no-deps",
@@ -615,7 +614,7 @@ fn write_files(files: &BTreeMap<PathBuf, String>) -> Result<(), AdapterError> {
 /// Run `cargo update ...` in `dir`; resolver failures become
 /// `ResolutionConflict`.
 fn cargo_update(dir: &Path, args: &[&str]) -> Result<(), AdapterError> {
-    match run(Command::new("cargo")
+    match run(crate::platform::command("cargo")
         .arg("update")
         .args(args)
         .current_dir(dir))
@@ -1308,7 +1307,7 @@ tempfile = { version = "3.3.0", default-features = false }
         let manifest = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
         assert!(manifest.contains("tempfile = \"3.4.0\""), "{manifest}");
         // The lockfile still matches the final manifest.
-        run(Command::new("cargo")
+        run(crate::platform::command("cargo")
             .args(["update", "--workspace", "--locked"])
             .current_dir(dir.path()))
         .unwrap();
